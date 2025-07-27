@@ -115,7 +115,7 @@ class EnhancedLlamaQFormerSAM2Config:
             'rank': 16,
             'alpha': 16.0,
             'dropout': 0.1,
-            'target_modules': ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'qkv', 'proj'],  # Hiera Attention層対応
+            'target_modules': ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'qkv'],  # Hiera Attention層対応（proj除外：特殊層エラー回避）
             'use_moe': True,        # MoE使用
             'num_experts': 2,       # RGB, Depth等
         }

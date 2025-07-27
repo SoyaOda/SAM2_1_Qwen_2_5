@@ -44,9 +44,9 @@ class LoRALayer(nn.Module):
         # スケーリング係数（PEFT準拠）
         self.scaling = self.alpha / self.rank
         
-        # 低ランク分解行列
-        self.lora_A = nn.Parameter(torch.zeros(rank, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        # 低ランク分解行列（学習可能パラメータ）
+        self.lora_A = nn.Parameter(torch.zeros(rank, in_features), requires_grad=True)
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank), requires_grad=True)
         
         # ドロップアウト
         if dropout > 0:
@@ -127,6 +127,11 @@ class LoRALinear(nn.Linear):
         self.merge_weights = merge_weights
         self.merged = False
         
+        # ベースレイヤーのパラメータを凍結（LoRAの基本原則）
+        self.weight.requires_grad = False
+        if self.bias is not None:
+            self.bias.requires_grad = False
+            
         # LoRAレイヤーの追加
         self.lora = LoRALayer(
             in_features,
@@ -301,6 +306,12 @@ class LoRAExpertMoE(nn.Module):
         self.base_layer = base_layer
         self.num_experts = num_experts
         self.rank = rank
+        
+        # ベースレイヤーのパラメータを凍結（LoRAの基本原則）
+        if hasattr(base_layer, 'weight') and base_layer.weight is not None:
+            base_layer.weight.requires_grad = False
+        if hasattr(base_layer, 'bias') and base_layer.bias is not None:
+            base_layer.bias.requires_grad = False
         
         # 入出力次元の取得
         if isinstance(base_layer, nn.Linear):
