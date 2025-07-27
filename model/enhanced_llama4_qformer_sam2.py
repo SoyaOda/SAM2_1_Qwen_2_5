@@ -115,7 +115,7 @@ class EnhancedLlamaQFormerSAM2Config:
             'rank': 16,
             'alpha': 16.0,
             'dropout': 0.1,
-            'target_modules': ['q_proj', 'k_proj', 'v_proj', 'o_proj'],  # Attention層
+            'target_modules': ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'qkv', 'proj'],  # Hiera Attention層対応
             'use_moe': True,        # MoE使用
             'num_experts': 2,       # RGB, Depth等
         }
@@ -477,7 +477,7 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
             multiscale_features = None
         
         # 2. Q-Formerでクエリ生成（テキスト入力対応）
-        # デバイス統一処理（動的デバイス移動）
+        # データ型整合性の確保（SAM2 float32 → Q-Former bfloat16）
         if image_features is not None:
             image_device = image_features.device
             image_dtype = image_features.dtype
@@ -488,10 +488,16 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
             print(f"    - 画像特徴: device={image_device}, dtype={image_dtype}")
             print(f"    - Q-Former: device={qformer_device}, dtype={qformer_dtype}")
             
-            # 動的デバイス移動
-            if image_device != qformer_device or image_dtype != qformer_dtype:
+            # データ型統一（明示的キャスト）：SAM2のfloat32をQ-Formerのbfloat16に変換
+            if image_dtype != qformer_dtype:
+                print(f"  🔄 画像特徴dtype変換: {image_dtype} -> {qformer_dtype}")
+                image_features = image_features.to(dtype=qformer_dtype)
+                print(f"  ✅ 画像特徴dtype変換完了")
+            
+            # デバイス統一
+            if image_device != qformer_device:
                 print(f"  🔄 Q-Former動的デバイス移動: {qformer_device} -> {image_device}")
-                self.qformer = self.qformer.to(device=image_device, dtype=image_dtype)
+                self.qformer = self.qformer.to(device=image_device)
                 print(f"  ✅ Q-Formerデバイス移動完了")
             else:
                 print(f"  ✅ Q-Formerデバイス統一済み: {image_device}")
