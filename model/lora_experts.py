@@ -73,6 +73,13 @@ class LoRALayer(nn.Module):
         Returns:
             適応された出力
         """
+        # デバイス統一：lora_A, lora_Bを入力と同じデバイスに移動
+        input_device = x.device
+        if self.lora_A.device != input_device:
+            self.lora_A.data = self.lora_A.data.to(input_device)
+        if self.lora_B.device != input_device:
+            self.lora_B.data = self.lora_B.data.to(input_device)
+        
         # LoRA補正の計算: x @ A^T @ B^T * scaling
         lora_output = self.lora_dropout(x) @ self.lora_A.T @ self.lora_B.T * self.scaling
         
@@ -138,6 +145,13 @@ class LoRALinear(nn.Linear):
         """
         LoRA適応付きforward
         """
+        # デバイス統一：LoRAレイヤーのパラメータを入力と同じデバイスに移動
+        input_device = x.device
+        if hasattr(self.lora, 'lora_A') and self.lora.lora_A.device != input_device:
+            self.lora.lora_A.data = self.lora.lora_A.data.to(input_device)
+        if hasattr(self.lora, 'lora_B') and self.lora.lora_B.device != input_device:
+            self.lora.lora_B.data = self.lora.lora_B.data.to(input_device)
+        
         # ベースのLinear計算
         if self.fan_in_fan_out:
             base_output = F.linear(x, self.weight.T, self.bias)
@@ -200,9 +214,10 @@ class MultiModalityRouter(nn.Module):
         # ノイズ生成（学習時のロバスト性向上）
         self.noise_std = 0.1
         
-        print(f"✅ MultiModalityRouter初期化")
-        print(f"  - エキスパート数: {num_experts}")
-        print(f"  - Top-K: {top_k}")
+        # ミュート: MultiModalityRouter初期化ログ
+        # print(f"✅ MultiModalityRouter初期化")
+        # print(f"  - エキスパート数: {num_experts}")
+        # print(f"  - Top-K: {top_k}")
     
     def forward(
         self,
@@ -309,13 +324,22 @@ class LoRAExpertMoE(nn.Module):
             **router_config
         )
         
+        # ルーターをベースレイヤーと同じデバイスに移動
+        if hasattr(base_layer, 'weight') and base_layer.weight is not None:
+            base_device = base_layer.weight.device
+            base_dtype = base_layer.weight.dtype
+            self.router = self.router.to(device=base_device, dtype=base_dtype)
+            # ミュート: ルーターデバイス移動ログ
+            # print(f"  ✅ ルーターをデバイス移動: {base_device}, dtype: {base_dtype}")
+        
         # エキスパート名（デバッグ用）
         self.expert_names = [f"expert_{i}" for i in range(num_experts)]
         
-        print(f"✅ LoRAExpertMoE初期化")
-        print(f"  - ベースレイヤー: {base_layer.__class__.__name__}")
-        print(f"  - エキスパート数: {num_experts}")
-        print(f"  - ランク: {rank}")
+        # ミュート: LoRAExpertMoE初期化ログ
+        # print(f"✅ LoRAExpertMoE初期化")
+        # print(f"  - ベースレイヤー: {base_layer.__class__.__name__}")
+        # print(f"  - エキスパート数: {num_experts}")
+        # print(f"  - ランク: {rank}")
     
     def forward(
         self,
@@ -335,12 +359,23 @@ class LoRAExpertMoE(nn.Module):
         # ベースレイヤーの出力
         base_output = self.base_layer(x)
         
+        # ルーターのデバイス統一を確保
+        input_device = x.device
+        if next(self.router.parameters()).device != input_device:
+            self.router = self.router.to(input_device)
+        
         # ルーティング重みの計算
         routing_weights = self.router(x, modality_hint)  # [B, num_experts]
         
-        # 各エキスパートの出力を計算
+        # 各エキスパートの出力を計算（デバイス統一付き）
         expert_outputs = []
         for i, expert in enumerate(self.experts):
+            # エキスパートのLoRAパラメータをデバイス統一
+            if expert.lora_A.device != input_device:
+                expert.lora_A.data = expert.lora_A.data.to(input_device)
+            if expert.lora_B.device != input_device:
+                expert.lora_B.data = expert.lora_B.data.to(input_device)
+            
             expert_output = expert(x)  # LoRA補正のみ
             expert_outputs.append(expert_output)
         
@@ -416,7 +451,8 @@ def inject_lora_to_model(
         for target in target_modules:
             if target in name and isinstance(module, nn.Linear):
                 modules_to_replace.append((name, module))
-                print(f"  ✅ ターゲット発見: {name} -> {module}")
+                # ミュート: ターゲット発見ログ
+                # print(f"  ✅ ターゲット発見: {name} -> {module}")
                 break
     
     print(f"  - 全Linearモジュール数: {len(all_linear_modules)}")
