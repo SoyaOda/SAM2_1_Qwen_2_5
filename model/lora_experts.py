@@ -226,22 +226,26 @@ class MultiModalityRouter(nn.Module):
         return_weights: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        ルーティング重みの計算
+        ルーティング重みの計算（モダリティ別エキスパート選択）
         
         Args:
-            x: 入力特徴 [B, seq_len, dim] or [B, dim]
+            x: 入力特徴 [B, seq_len, dim] or [B, dim] or [B*seq, dim]
             modality_hint: モダリティヒント（オプション）
             return_weights: 重みも返すか
         
         Returns:
-            routing_weights: ルーティング重み [B, num_experts]
+            routing_weights: ルーティング重み [B, num_experts] or [1, num_experts]
             (optional) routing_logits: ルーティングロジット
         """
-        # 入力特徴の集約（シーケンスの場合）
+        # 入力特徴の集約（入力全体で1つのモダリティと仮定）
         if x.dim() == 3:
-            # [B, seq_len, dim] -> [B, dim]
+            # [B, seq_len, dim] -> [B, dim] バッチごとの平均プール
             routing_input = x.mean(dim=1)
+        elif x.dim() == 2 and x.shape[0] > 1:
+            # [B*seq, dim] or [seq, dim] -> [1, dim] 全体平均（単一モダリティ）
+            routing_input = x.mean(dim=0, keepdim=True)
         else:
+            # [B, dim] already
             routing_input = x
         
         # モダリティヒントがある場合は結合
@@ -249,7 +253,7 @@ class MultiModalityRouter(nn.Module):
             routing_input = torch.cat([routing_input, modality_hint], dim=-1)
         
         # ルーティングロジットの計算
-        routing_logits = self.router(routing_input)
+        routing_logits = self.router(routing_input)  # [B, num_experts] or [1, num_experts]
         
         # 学習時はノイズを追加（Mixture of Expertsの標準的手法）
         if self.training and self.noise_std > 0:
@@ -379,16 +383,29 @@ class LoRAExpertMoE(nn.Module):
             expert_output = expert(x)  # LoRA補正のみ
             expert_outputs.append(expert_output)
         
-        # エキスパート出力をスタック
-        expert_outputs = torch.stack(expert_outputs, dim=0)  # [num_experts, B, ...]
+        # エキスパート出力をスタック: [num_experts, *expert_output.shape]
+        expert_outputs = torch.stack(expert_outputs, dim=0)  # [num_experts, ...]
         
-        # 重み付き結合
-        # routing_weightsを適切な形状に拡張
-        weight_shape = [self.num_experts] + [1] * (expert_outputs.dim() - 1)
-        routing_weights = routing_weights.T.view(weight_shape)  # [num_experts, 1, ...]
+        # routing_weightsの形状確認とデバッグ
+        # routing_weights: [B, num_experts] or [1, num_experts]
+        batch_size = routing_weights.shape[0]
+        
+        # routing_weightsを正しい形状に変換
+        if batch_size == 1:
+            # 単一入力の場合: [1, num_experts] -> [num_experts]
+            weights = routing_weights.squeeze(0)  # [num_experts]
+        else:
+            # バッチ入力の場合: [B, num_experts] -> [num_experts, B] -> バッチ平均
+            weights = routing_weights.mean(dim=0)  # [num_experts] 
+        
+        # 重み付き結合：アインシュタイン記法を使用
+        # expert_outputs: [num_experts, ...], weights: [num_experts]
+        # 重みを適切に拡張してブロードキャスト
+        for _ in range(expert_outputs.dim() - 1):
+            weights = weights.unsqueeze(-1)  # [num_experts, 1, 1, ...]
         
         # 重み付き平均
-        combined_lora = (expert_outputs * routing_weights).sum(dim=0)
+        combined_lora = (expert_outputs * weights).sum(dim=0)
         
         # ベース出力とLoRA補正を結合
         return base_output + combined_lora
@@ -470,7 +487,9 @@ def inject_lora_to_model(
     # LoRAの注入（メモリ安全処理付き）
     injection_count = 0
     for i, (name, module) in enumerate(modules_to_replace):
-        print(f"  🔧 LoRA注入中 ({i+1}/{len(modules_to_replace)}): {name}")
+        # ミュート: 詳細注入ログ（5個ごとに要約）
+        if i % 5 == 0 or i == len(modules_to_replace) - 1:
+            print(f"  🔧 LoRA注入進行中: {i+1}/{len(modules_to_replace)}")
         
         try:
             # GPU メモリ状況を定期チェック
@@ -524,7 +543,8 @@ def inject_lora_to_model(
             # モジュールを置換
             setattr(parent, child_name, lora_module)
             injection_count += 1
-            print(f"    ✅ 注入完了: {name}")
+            # ミュート: 個別注入完了ログ
+            # print(f"    ✅ 注入完了: {name}")
             
         except Exception as e:
             print(f"    ❌ LoRA注入エラー ({name}): {str(e)}")
