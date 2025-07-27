@@ -46,6 +46,18 @@ class MultiScaleFeatureExtractor(nn.Module):
         blocks = None
         stage_ends = None
         
+        # デバッグ: モデル構造を詳細に調査
+        print(f"🔍 SAM2モデル構造調査:")
+        print(f"  - モデルタイプ: {type(model).__name__}")
+        print(f"  - 利用可能な主要属性:")
+        for attr in ['trunk', 'neck', 'fpn', 'patch_embed', 'blocks', 'encoder']:
+            if hasattr(model, attr):
+                attr_obj = getattr(model, attr)
+                print(f"    - {attr}: {type(attr_obj).__name__}")
+                # さらに深く調査
+                if hasattr(attr_obj, 'blocks'):
+                    print(f"      - {attr}.blocks: {type(attr_obj.blocks).__name__} (長さ: {len(attr_obj.blocks) if hasattr(attr_obj.blocks, '__len__') else 'N/A'})")
+        
         # SAM2のImageEncoderの場合（trunk.blocks構造）
         if hasattr(model, 'trunk') and hasattr(model.trunk, 'blocks'):
             trunk = model.trunk
@@ -55,20 +67,27 @@ class MultiScaleFeatureExtractor(nn.Module):
             if hasattr(trunk, 'stage_ends'):
                 stage_ends = trunk.stage_ends
                 print(f"  - SAM2 Hiera検出: {len(blocks)}ブロック, ステージ境界: {stage_ends}")
+            
+            # Hieraの詳細構造を確認
+            print(f"  - Hieraブロック詳細:")
+            for i, block in enumerate(blocks[:3]):  # 最初の3ブロックのみ
+                print(f"    - Block {i}: {type(block).__name__}")
         
         # 標準的なViT構造
         elif hasattr(model, 'blocks'):
             blocks = model.blocks
+            print(f"  - 標準ViT構造検出: {len(blocks)}ブロック")
         
         # HuggingFace形式
         elif hasattr(model, 'encoder') and hasattr(model.encoder, 'layer'):
             blocks = model.encoder.layer
+            print(f"  - HuggingFace形式検出: {len(blocks)}層")
         
         if blocks is None or (isinstance(blocks, list) and len(blocks) == 0):
             # フォールバック: フック登録をスキップ
             print("⚠️ MultiScaleFeatureExtractor: 適切なブロック構造が見つかりません")
             print(f"  - モデルタイプ: {type(model)}")
-            print(f"  - 利用可能な属性: {[attr for attr in dir(model) if not attr.startswith('_')][:10]}")
+            print(f"  - 利用可能な属性: {[attr for attr in dir(model) if not attr.startswith('_')][:15]}")
             return
         
         # 各ステージにフックを登録
@@ -140,6 +159,38 @@ class MultiScaleFeatureExtractor(nn.Module):
             
             # 最終出力も保存（Q-Former用）
             self.feature_maps['final'] = final_features
+            
+            # デバッグ: 収集された特徴マップの形状を確認
+            print(f"🔍 マルチスケール特徴抽出結果:")
+            for name, feat in self.feature_maps.items():
+                if isinstance(feat, torch.Tensor):
+                    print(f"  - {name}: {feat.shape} (device: {feat.device}, dtype: {feat.dtype})")
+                else:
+                    print(f"  - {name}: {type(feat)}")
+            
+            # 特徴マップが期待される形状でない場合の修正
+            # SAM2 Hieraは[B, num_patches, hidden_dim]形式で出力することがある
+            for name, feat in list(self.feature_maps.items()):
+                if isinstance(feat, torch.Tensor) and feat.dim() == 3:
+                    B, N, C = feat.shape
+                    # トークン数が少なすぎる場合はスキップ
+                    if N < 100:  # 10x10以下の解像度は無視
+                        print(f"  ⚠️ {name}のトークン数が少なすぎます ({N}トークン) - スキップ")
+                        del self.feature_maps[name]
+                        continue
+                    
+                    # 空間次元を推定して4D形状に変換
+                    H = W = int(math.sqrt(N))
+                    if H * W == N:
+                        # 正方形の場合
+                        feat_4d = feat.transpose(1, 2).reshape(B, C, H, W)
+                        self.feature_maps[name] = feat_4d
+                        print(f"  ✅ {name}を4D形状に変換: {feat.shape} -> {feat_4d.shape}")
+                    else:
+                        # 正方形でない場合は最も近い矩形を推定
+                        # SAM2は通常正方形なのでこのケースは稀
+                        print(f"  ⚠️ {name}の空間次元が推定できません (N={N}) - そのまま保持")
+                        
         else:
             # フックが登録できない場合は通常の出力のみ
             print("⚠️ マルチスケール特徴抽出が利用できません - 最終出力のみ使用")
@@ -327,13 +378,36 @@ class EnhancedMaskDecoder(nn.Module):
             masks: 予測マスク [B, num_masks, H, W]
             iou_pred: IoU予測スコア [B, num_masks]
         """
+        # SAM2標準次元一致確認（デバッグ修正ルール対応）
+        # Webリサーチ結果: image_embeddings, dense_prompt_embeddingsの空間次元は一致が必要
+        if image_embeddings.dim() == 4 and dense_prompt_embeddings.dim() == 4:
+            img_h, img_w = image_embeddings.shape[-2:]
+            dense_h, dense_w = dense_prompt_embeddings.shape[-2:]
+            
+            if (img_h, img_w) != (dense_h, dense_w):
+                print(f"  🔧 次元不整合修正: image_embeddings{(img_h, img_w)} vs dense_prompt_embeddings{(dense_h, dense_w)}")
+                
+                # dense_prompt_embeddingsをimage_embeddingsの解像度に合わせる
+                import torch.nn.functional as F
+                dense_prompt_embeddings = F.interpolate(
+                    dense_prompt_embeddings, 
+                    size=(img_h, img_w), 
+                    mode='bilinear', 
+                    align_corners=False
+                )
+                print(f"  ✅ dense_prompt_embeddings調整完了: -> {(img_h, img_w)}")
+        
         # メインデコーダー（低解像度特徴）
+        # SAM2 MaskDecoderにはrepeat_imageとhigh_res_featuresパラメータが必要
+        # Webリサーチ結果: high_res_featuresは None または [4*H*4*W特徴, 2*H*2*W特徴] のリスト
         masks_main, iou_pred = self.main_decoder(
             image_embeddings=image_embeddings,
             image_pe=image_pe,
             sparse_prompt_embeddings=sparse_prompt_embeddings,
             dense_prompt_embeddings=dense_prompt_embeddings,
-            multimask_output=multimask_output
+            multimask_output=multimask_output,
+            repeat_image=False,  # バッチ処理済みの場合
+            high_res_features=None  # 高解像度特徴は後で追加（現在は無効）
         )
         
         # マルチスケール処理が不要な場合
@@ -528,28 +602,56 @@ class MultiScaleSegmentationHead(nn.Module):
                 "SAM2の初期化でimage_encoderが正しく設定されませんでした。"
             )
         
-        # マルチスケール特徴抽出
-        multiscale_features = self.feature_extractor(images, self.image_encoder)
+        # デバッグ修正ルール: 段階的修正でマルチスケール特徴抽出
+        print(f"🔍 MultiScaleSegmentationHead.forward開始")
+        print(f"  - 入力画像: {images.shape}")
         
-        # メイン特徴（最終層またはfinal）
-        if 'stage_4' in multiscale_features:
-            image_embeddings = multiscale_features['stage_4']
-        elif 'final' in multiscale_features:
-            image_embeddings = multiscale_features['final']
-        else:
-            # 全ての特徴マップから最も適切なものを選択
-            if multiscale_features:
-                # 最後のステージの特徴を使用
-                sorted_keys = sorted(multiscale_features.keys())
-                image_embeddings = multiscale_features[sorted_keys[-1]]
+        # まず基本的な画像エンコードで動作確認
+        try:
+            # 直接エンコード
+            encoded_output = self.image_encoder(images)
+            # SAM2は辞書形式で返すことがある
+            if isinstance(encoded_output, dict) and 'vision_features' in encoded_output:
+                image_embeddings = encoded_output['vision_features']
             else:
-                # フォールバック: 直接エンコード
-                encoded_output = self.image_encoder(images)
-                # SAM2は辞書形式で返すことがある
-                if isinstance(encoded_output, dict) and 'vision_features' in encoded_output:
-                    image_embeddings = encoded_output['vision_features']
+                image_embeddings = encoded_output
+            
+            print(f"  ✅ 基本エンコード成功: {image_embeddings.shape}")
+            
+            # マルチスケール特徴抽出を試行
+            try:
+                multiscale_features = self.feature_extractor(images, self.image_encoder)
+                
+                # マルチスケール特徴の利用可能性を確認
+                valid_features = {}
+                for name, feat in multiscale_features.items():
+                    if isinstance(feat, torch.Tensor) and feat.numel() > 0:
+                        valid_features[name] = feat
+                
+                if len(valid_features) > 1:
+                    print(f"  ✅ マルチスケール特徴利用可能: {list(valid_features.keys())}")
+                    
+                    # finalがあればそれを優先使用
+                    if 'final' in valid_features:
+                        image_embeddings = valid_features['final']
+                    # stage_4があれば使用
+                    elif 'stage_4' in valid_features:
+                        image_embeddings = valid_features['stage_4']
+                    # それ以外は最後のステージを使用
+                    else:
+                        sorted_keys = sorted(valid_features.keys())
+                        image_embeddings = valid_features[sorted_keys[-1]]
                 else:
-                    image_embeddings = encoded_output
+                    print(f"  ⚠️ 有効なマルチスケール特徴が不足: {len(valid_features)}個")
+                    multiscale_features = None
+                    
+            except Exception as ms_error:
+                print(f"  ❌ マルチスケール特徴抽出エラー: {str(ms_error)}")
+                multiscale_features = None
+                
+        except Exception as enc_error:
+            print(f"  ❌ 基本エンコードエラー: {str(enc_error)}")
+            raise RuntimeError(f"画像エンコードに失敗しました: {str(enc_error)}")
         
         # prompt_encoderの確認
         if self.prompt_encoder is None:
@@ -564,6 +666,35 @@ class MultiScaleSegmentationHead(nn.Module):
             boxes=boxes,
             masks=masks
         )
+        
+        # マルチスケール対応: SAM2標準解像度（64x64）に統一
+        # Webリサーチ結果: SAM2 MaskDecoderは64x64解像度で動作
+        # image embeddings: 1x256x64x64, dense_prompt_embeddingsも同じ解像度が必要
+        if multiscale_features is not None and len(multiscale_features) > 0:
+            import torch.nn.functional as F
+            
+            # SAM2標準解像度（64x64）に統一
+            sam2_standard_size = (64, 64)
+            
+            # dense_embeddingsをSAM2標準解像度に調整
+            if dense_embeddings.shape[-2:] != sam2_standard_size:
+                dense_embeddings = F.interpolate(
+                    dense_embeddings, 
+                    size=sam2_standard_size, 
+                    mode='bilinear', 
+                    align_corners=False
+                )
+                print(f"  🔧 dense_embeddings SAM2標準解像度調整: -> {sam2_standard_size}")
+            
+            # image_embeddingsもSAM2標準解像度に調整（必要に応じて）
+            if image_embeddings.dim() == 4 and image_embeddings.shape[-2:] != sam2_standard_size:
+                print(f"  ⚠️ image_embeddings解像度調整: {image_embeddings.shape[-2:]} -> {sam2_standard_size}")
+                image_embeddings = F.interpolate(
+                    image_embeddings, 
+                    size=sam2_standard_size, 
+                    mode='bilinear', 
+                    align_corners=False
+                )
         
         # 位置エンコーディング
         image_pe = self.prompt_encoder.get_dense_pe()
