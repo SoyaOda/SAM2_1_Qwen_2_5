@@ -254,6 +254,32 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
                 stages=self.config.multiscale_config['stages']
             )
             print("✅ マルチスケールセグメンテーションヘッド有効")
+            
+            # 高解像度特徴精緻化用デコーダーモジュール初期化
+            print("🔧 高解像度Auxデコーダーモジュール初期化...")
+            # Stage1(=stride4)特徴: 144ch -> 64ch
+            self.conv_stage1 = nn.Conv2d(144, 64, kernel_size=1)
+            # Stage2(=stride8)特徴: 288ch -> 64ch
+            self.conv_stage2 = nn.Conv2d(288, 64, kernel_size=1)
+            # Refine1: (coarse_mask+stage2_feat) -> intermediate mask
+            self.refine1_net = nn.Sequential(
+                nn.Conv2d(1 + 64, 32, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 1, kernel_size=3, padding=1)
+            )
+            # Refine2: (refine1_mask+stage1_feat) -> refined mask
+            self.refine2_net = nn.Sequential(
+                nn.Conv2d(1 + 64, 32, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 1, kernel_size=3, padding=1)
+            )
+            # モジュールをSAM2の計算精度に合わせる
+            target_dtype = self.config.torch_dtype if isinstance(self.config.torch_dtype, torch.dtype) else getattr(torch, str(self.config.torch_dtype), torch.bfloat16)
+            self.conv_stage1 = self.conv_stage1.to(target_dtype)
+            self.conv_stage2 = self.conv_stage2.to(target_dtype)
+            self.refine1_net = self.refine1_net.to(target_dtype)
+            self.refine2_net = self.refine2_net.to(target_dtype)
+            print("✅ 高解像度Auxデコーダーモジュール初期化完了")
         else:
             # 通常のSAM2使用
             self.segmentation_head = sam_wrapper
@@ -451,6 +477,25 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
             multiscale_features = None
         
         # 2. Q-Formerでクエリ生成（テキスト入力対応）
+        # デバイス統一処理（動的デバイス移動）
+        if image_features is not None:
+            image_device = image_features.device
+            image_dtype = image_features.dtype
+            qformer_device = next(self.qformer.parameters()).device
+            qformer_dtype = next(self.qformer.parameters()).dtype
+            
+            print(f"  🔍 Q-Formerデバイス状況:")
+            print(f"    - 画像特徴: device={image_device}, dtype={image_dtype}")
+            print(f"    - Q-Former: device={qformer_device}, dtype={qformer_dtype}")
+            
+            # 動的デバイス移動
+            if image_device != qformer_device or image_dtype != qformer_dtype:
+                print(f"  🔄 Q-Former動的デバイス移動: {qformer_device} -> {image_device}")
+                self.qformer = self.qformer.to(device=image_device, dtype=image_dtype)
+                print(f"  ✅ Q-Formerデバイス移動完了")
+            else:
+                print(f"  ✅ Q-Formerデバイス統一済み: {image_device}")
+        
         qformer_outputs = self.qformer(
             image_feats=image_features,
             text_input=text_input,
@@ -509,49 +554,141 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
         sam_prompts = qformer_outputs['sam_prompts']  # [B, 32, 256]
         
         if self.enable_multiscale:
-            # マルチスケールマスク生成（高解像度特徴対応版）
-            print(f"🔍 マルチスケールマスク生成: 高解像度特徴活用")
+            # マルチスケールマスク生成（ユーザー提案の新実装：SAM2粗マスク+高解像度特徴精緻化）
+            print(f"🔍 マルチスケールマスク生成: SAM2粗マスク+高解像度特徴精緻化方式")
             
-            try:
-                masks, iou_scores, _ = self.segmentation_head(
-                    images=images,
-                    visual_context=separated_outputs['visual_features'],
-                    multimask_output=True
-                )
-                print(f"  ✅ マルチスケールマスク生成成功: {masks.shape}")
+            # SAM2でcoarse mask予測（プロンプト使用）
+            if hasattr(self.segmentation_head, 'sam_wrapper'):
+                sam_wrapper = self.segmentation_head.sam_wrapper
+            else:
+                sam_wrapper = self.segmentation_head
+            
+            predicted_masks = []
+            iou_predictions = []
+            
+            # バッチ内各サンプル処理
+            for batch_idx in range(batch_size):
+                # 画像データとプロンプト準備
+                image_tensor = images[batch_idx]  # (3, H, W)
+                # SAM2はnumpy入力想定（HWC形式）
+                image_np = image_tensor.permute(1, 2, 0).cpu().numpy()  # (H, W, 3)
+                prompts_np = sam_prompts[batch_idx].detach().cpu().numpy()  # (32, 256)
                 
-            except Exception as ms_error:
-                print(f"  ❌ マルチスケールマスク生成エラー: {str(ms_error)}")
-                print(f"    - エラータイプ: {type(ms_error).__name__}")
-                
-                # フォールバック: 通常のSAM2処理
-                print(f"  🔄 フォールバック: 通常SAM2処理")
-                if hasattr(self.segmentation_head, 'sam_wrapper'):
-                    sam_wrapper = self.segmentation_head.sam_wrapper
-                elif hasattr(self.segmentation_head, 'predictor'):
-                    # 直接SAM2Wrapperとして扱う
-                    sam_wrapper = self.segmentation_head
-                else:
-                    raise RuntimeError("フォールバック用のSAM2Wrapperが見つかりません")
-                    
-                if hasattr(sam_wrapper, 'predict_with_prompts'):
-                    sam_wrapper.set_image(images)
-                    outputs_dict = sam_wrapper.predict_with_prompts(
-                        prompt_embeddings=sam_prompts,
-                        point_coords=None,
-                        point_labels=None,
-                        boxes=None,
+                try:
+                    # ① SAM2でマスク予測（coarseマスク群取得）
+                    sam_wrapper.set_image(image_np)
+                    sam_results = sam_wrapper.predict_with_prompts(
+                        prompt_embeddings=prompts_np, 
                         multimask_output=True
                     )
+                    masks = sam_results['masks']  # torch.Tensor [3, H, W] (bfloat16)
+                    iou_preds = sam_results.get('iou_predictions', None)
+                    if iou_preds is not None:
+                        iou_preds = torch.tensor(iou_preds, device=masks.device, dtype=masks.dtype)
                     
-                    masks = outputs_dict['masks']
-                    if masks.dim() == 3:
-                        masks = masks.unsqueeze(0)
-                    iou_scores = outputs_dict['iou_predictions']
-                    if iou_scores.dim() == 1:
-                        iou_scores = iou_scores.unsqueeze(0)
-                else:
-                    raise RuntimeError("SAM2予測メソッドが見つかりません")
+                    print(f"📊 SAM2出力統計: masks: {masks.shape}, {masks.dtype}, device: {masks.device}")
+                    if iou_preds is not None:
+                        print(f"            iou_predictions: {iou_preds.shape}, 平均IoU: {iou_preds.mean().item():.3f}")
+                    
+                    # ② マルチスケール特徴抽出（高解像度特徴でマスク精緻化）
+                    print(f"🔍 高解像度特徴抽出開始")
+                    sam_model = sam_wrapper.model  # SAM2モデル
+                    feat1 = feat2 = None
+                    x = image_tensor.unsqueeze(0).to(sam_wrapper._target_device)
+                    
+                    with torch.no_grad():
+                        # Hiera ViTの中間特徴抽出（stage1=stride4, stage2=stride8）
+                        for idx, blk in enumerate(sam_model.image_encoder.trunk.blocks):
+                            x = blk(x)
+                            if idx == 1:
+                                feat1 = x  # stage1 (stride4) - 高解像度
+                            if idx == 7:
+                                feat2 = x  # stage2 (stride8) - 中解像度
+                    
+                    if feat1 is None or feat2 is None:
+                        raise RuntimeError("必要な中間特徴が取得できません")
+                    
+                    print(f"🎯 抽出特徴: stage1 {feat1.shape}, stage2 {feat2.shape}")
+                    
+                    # FP16/BF16対応: 特徴量をSAM2 dtypeに変換
+                    target_dtype = self.config.torch_dtype if isinstance(self.config.torch_dtype, torch.dtype) else getattr(torch, str(self.config.torch_dtype), torch.bfloat16)
+                    feat1 = feat1.to(target_dtype)
+                    feat2 = feat2.to(target_dtype)
+                    
+                    # ③ 高解像度特徴精緻化処理
+                    stage1_proj = self.conv_stage1(feat1)  # (1,64,112,112)
+                    stage2_proj = self.conv_stage2(feat2)  # (1,64,56,56)
+                    
+                    # 空間解像度リサイズ
+                    stage1_up = F.interpolate(stage1_proj, size=(256, 256), mode='bilinear', align_corners=False)
+                    stage2_up = F.interpolate(stage2_proj, size=(128, 128), mode='bilinear', align_corners=False)
+                    
+                    print(f"    📐 特徴リサイズ: stage1 -> (256, 256), stage2 -> (128, 128)")
+                    
+                    # 各提案マスクに対して精緻化処理を適用
+                    refined_masks = []
+                    for m in range(masks.shape[0]):  # 通常3提案
+                        coarse_mask = masks[m]  # (H, W)
+                        coarse_mask_t = coarse_mask.to(target_dtype)
+                        
+                        # coarse maskを高解像度特徴の解像度にダウンサンプル
+                        coarse_mask_128 = F.interpolate(
+                            coarse_mask_t.unsqueeze(0).unsqueeze(0), 
+                            size=(128, 128), mode='bilinear', align_corners=False
+                        )  # (1,1,128,128)
+                        # coarse_mask_256 = F.interpolate(
+                        #     coarse_mask_t.unsqueeze(0).unsqueeze(0), 
+                        #     size=(256, 256), mode='bilinear', align_corners=False
+                        # )  # (1,1,256,256) - 現在の実装では未使用
+                        
+                        # Stage2レベルでマスク精緻化
+                        inp2 = torch.cat([coarse_mask_128, stage2_up], dim=1)  # (1, 65, 128, 128)
+                        refine1_mask = self.refine1_net(inp2)  # (1,1,128,128)
+                        
+                        # Stage1レベルでさらに精緻化
+                        inp1 = torch.cat([
+                            F.interpolate(refine1_mask, size=(256, 256), mode='bilinear', align_corners=False), 
+                            stage1_up
+                        ], dim=1)  # (1, 65, 256,256)
+                        refine2_mask = self.refine2_net(inp1)  # (1,1,256,256)
+                        
+                        # 最終マスクを元解像度にアップサンプル
+                        final_mask = F.interpolate(
+                            refine2_mask, 
+                            size=(coarse_mask.shape[-2], coarse_mask.shape[-1]), 
+                            mode='bilinear', align_corners=False
+                        )  # (1,1,H,W)
+                        final_mask = torch.sigmoid(final_mask)  # (1,1,H,W) [0,1]に正規化
+                        refined_masks.append(final_mask.squeeze(0))  # (1,H,W)
+                        
+                        # デバッグ: マスク値範囲
+                        fm = final_mask.squeeze(0)
+                        print(f"    🔍 提案{m+1}精緻化マスク統計: min={float(fm.min()):.6f}, max={float(fm.max()):.6f}, mean={float(fm.mean()):.6f}")
+                    
+                    refined_masks = torch.stack(refined_masks, dim=0)  # (3, H, W)
+                    print(f"  ✅ マルチスケールマスク生成成功: 精緻化マスク{refined_masks.shape}")
+                    
+                    predicted_masks.append(refined_masks.to(device))
+                    if iou_preds is not None:
+                        iou_predictions.append(iou_preds.to(device))
+                        
+                except Exception as e:
+                    # エラー時はフォールバック: 通常のSAM2マスクを使用
+                    print(f"  ❌ マルチスケールマスク生成エラー: {e}")
+                    if 'masks' in locals():
+                        predicted_masks.append(masks.to(device))
+                        if iou_preds is not None:
+                            iou_predictions.append(iou_preds.to(device))
+                    else:
+                        # 最後の手段: ゼロマスク
+                        predicted_masks.append(torch.zeros((3, image_tensor.shape[1], image_tensor.shape[2]), device=device))
+                        iou_predictions.append(torch.zeros(3, device=device))
+            
+            masks = torch.stack(predicted_masks, dim=0)  # (B, 3, H, W)
+            if iou_predictions:
+                iou_scores = torch.stack(iou_predictions, dim=0)  # (B, 3)
+            else:
+                iou_scores = torch.zeros((batch_size, 3), device=device)
         else:
             # 通常のマスク生成
             # マルチスケールが無効の場合、self.segmentation_head自体がSAM2Wrapper

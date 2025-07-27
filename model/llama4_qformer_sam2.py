@@ -898,19 +898,50 @@ class QFormerSegmentationBridge(nn.Module):
         print(f"  🔍 Q-Former 64クエリ抽出...")
         encoder_hidden_states = llama_outputs.hidden_states[-1]
         
-        # デバイス・データ型統一
+        # デバイス・データ型統一（Webリサーチベース：動的デバイス移動）
         llama_device = encoder_hidden_states.device
         llama_dtype = encoder_hidden_states.dtype
         qformer_device = next(self.qformer.parameters()).device
         qformer_dtype = next(self.qformer.parameters()).dtype
         
+        print(f"  🔍 デバイス状況確認:")
+        print(f"    - Llama入力: device={llama_device}, dtype={llama_dtype}")
+        print(f"    - Q-Former: device={qformer_device}, dtype={qformer_dtype}")
+        print(f"    - query_embeds: device={self.query_embeds.device}, dtype={self.query_embeds.dtype}")
+        
+        # Webリサーチ結果: 動的デバイス移動で一貫性確保
+        device_moved = False
         if llama_device != qformer_device or llama_dtype != qformer_dtype:
+            print(f"  🔄 Q-Former動的デバイス移動: {qformer_device} -> {llama_device}")
             self.qformer = self.qformer.to(device=llama_device, dtype=llama_dtype)
             self.enhanced_sam_projector = self.enhanced_sam_projector.to(device=llama_device, dtype=llama_dtype)
+            device_moved = True
+        
+        # query_embedsもLlamaデバイスに統一（Webリサーチ準拠：Parameter型維持）
+        if self.query_embeds.device != llama_device or self.query_embeds.dtype != llama_dtype:
+            print(f"  🔄 query_embeds動的移動: {self.query_embeds.device} -> {llama_device}")
+            print(f"    - 移動前型: {type(self.query_embeds)} (Parameter: {isinstance(self.query_embeds, nn.Parameter)})")
+            # Webリサーチ結果: Parameter型を維持したデバイス移動
+            with torch.no_grad():
+                self.query_embeds.data = self.query_embeds.data.to(device=llama_device, dtype=llama_dtype)
+            print(f"    - 移動後型: {type(self.query_embeds)} (Parameter: {isinstance(self.query_embeds, nn.Parameter)})")
+            print(f"    - 移動後デバイス: {self.query_embeds.device}, dtype: {self.query_embeds.dtype}")
+            device_moved = True
+        
+        if device_moved:
+            print(f"  ✅ デバイス統一完了: 全コンポーネントが{llama_device}に配置")
+        else:
+            print(f"  ✅ デバイス統一済み: {llama_device}")
         
         # Query embedsの展開
         batch_size = encoder_hidden_states.shape[0]
         query_embeds = self.query_embeds.expand(batch_size, -1, -1)
+        
+        # 最終検証: 全テンソルのデバイス一致確認
+        print(f"  🔍 最終デバイス検証:")
+        print(f"    - encoder_hidden_states: {encoder_hidden_states.device}")
+        print(f"    - query_embeds: {query_embeds.device}")
+        print(f"    - Q-Former layernorm weight: {next(self.qformer.layernorm.parameters()).device}")
         
         # 🔄 公式Blip2QFormerModel実行
         
