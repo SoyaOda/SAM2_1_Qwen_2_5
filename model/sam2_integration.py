@@ -324,6 +324,21 @@ class SAM2Wrapper(nn.Module):
             if image.dtype == torch.bfloat16:
                 image = image.to(torch.float32)
             
+            # バッチ処理の対応
+            if image.dim() == 4:
+                # [B, C, H, W] -> 最初の画像のみ使用（SAM2は単一画像処理）
+                if image.size(0) > 1:
+                    print(f"⚠️ SAM2は単一画像処理のみ対応。バッチサイズ{image.size(0)}の最初の画像のみ使用")
+                image = image[0]  # [C, H, W]
+            
+            # チャネルを最後に移動 [C, H, W] -> [H, W, C]
+            if image.dim() == 3 and image.size(0) in [1, 3]:
+                image = image.permute(1, 2, 0)
+            
+            # 値の範囲を[0, 255]に正規化
+            if image.max() <= 1.0:
+                image = image * 255.0
+            
             image_np = image.detach().cpu().numpy().astype('uint8')
         else:
             image_np = image

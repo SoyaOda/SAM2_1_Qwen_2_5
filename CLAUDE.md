@@ -42,6 +42,8 @@ md_filesを元に実装してきた（まだ未実装もあり）。
 ### Lambda Cloud Development Workflow
 Lambda Cloud環境での実行を行うので、ローカルファイルの修正を行うたびに、以下のコマンド例を参考に、lambda上に転送し、lambda上で実行すること
 
+※タイムアウトは設定しないこと！
+
 ```bash
 # File transfer to Lambda Cloud
 rsync -avz --progress --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='lambda_results' --exclude='verification_output' --exclude='vis_output' --exclude='.gitignore' -e "ssh -i ~/.ssh/lambda_cloud_key" ./ ubuntu@<ip address>:/lambda/nfs/lisa-gemma-project-fs/code/LISA-Gemma-Linux/
