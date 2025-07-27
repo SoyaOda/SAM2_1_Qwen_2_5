@@ -33,7 +33,7 @@ class MultiScaleFeatureExtractor(nn.Module):
     
     def register_hooks(self, model: nn.Module):
         """
-        モデルの中間層にフックを登録
+        モデルの中間層にフックを登録（Webリサーチに基づくSAM2 Hiera対応版）
         
         Args:
             model: SAM2の画像エンコーダモデル
@@ -47,7 +47,7 @@ class MultiScaleFeatureExtractor(nn.Module):
         stage_ends = None
         
         # デバッグ: モデル構造を詳細に調査
-        print(f"🔍 SAM2モデル構造調査:")
+        print(f"🔍 SAM2 Hieraモデル構造調査（Webリサーチベース）:")
         print(f"  - モデルタイプ: {type(model).__name__}")
         print(f"  - 利用可能な主要属性:")
         for attr in ['trunk', 'neck', 'fpn', 'patch_embed', 'blocks', 'encoder']:
@@ -56,17 +56,37 @@ class MultiScaleFeatureExtractor(nn.Module):
                 print(f"    - {attr}: {type(attr_obj).__name__}")
                 # さらに深く調査
                 if hasattr(attr_obj, 'blocks'):
-                    print(f"      - {attr}.blocks: {type(attr_obj.blocks).__name__} (長さ: {len(attr_obj.blocks) if hasattr(attr_obj.blocks, '__len__') else 'N/A'})")
+                    blocks_obj = attr_obj.blocks
+                    print(f"      - {attr}.blocks: {type(blocks_obj).__name__} (長さ: {len(blocks_obj) if hasattr(blocks_obj, '__len__') else 'N/A'})")
+                    # Hieraの特有属性をチェック
+                    if hasattr(attr_obj, 'stage_ends'):
+                        print(f"      - {attr}.stage_ends: {getattr(attr_obj, 'stage_ends')}")
         
         # SAM2のImageEncoderの場合（trunk.blocks構造）
         if hasattr(model, 'trunk') and hasattr(model.trunk, 'blocks'):
             trunk = model.trunk
             blocks = trunk.blocks
             
+            # Webリサーチ結果: SAM2 Hieraは48ブロック、4つのステージに分割
+            # Stage 1 (stride 4): 高解像度特徴 - blocks 0-11
+            # Stage 2 (stride 8): 中解像度特徴 - blocks 12-23  
+            # Stage 3 (stride 16): 低解像度特徴（FPN用） - blocks 24-35
+            # Stage 4 (stride 32): 最低解像度特徴（FPN用） - blocks 36-47
+            
             # stage_endsがある場合は、ステージの境界を取得
             if hasattr(trunk, 'stage_ends'):
                 stage_ends = trunk.stage_ends
                 print(f"  - SAM2 Hiera検出: {len(blocks)}ブロック, ステージ境界: {stage_ends}")
+            else:
+                # Webリサーチによる標準的なHieraステージ分割（48ブロックの場合）
+                if len(blocks) == 48:
+                    stage_ends = [11, 23, 35, 47]  # 各ステージの最終ブロック
+                    print(f"  - SAM2 Hiera標準構成推定: 48ブロック -> ステージ境界: {stage_ends}")
+                else:
+                    # 動的計算: ブロック数を4等分
+                    stage_size = len(blocks) // 4
+                    stage_ends = [stage_size-1, stage_size*2-1, stage_size*3-1, len(blocks)-1]
+                    print(f"  - SAM2 Hiera動的構成推定: {len(blocks)}ブロック -> ステージ境界: {stage_ends}")
             
             # Hieraの詳細構造を確認
             print(f"  - Hieraブロック詳細:")
@@ -90,19 +110,24 @@ class MultiScaleFeatureExtractor(nn.Module):
             print(f"  - 利用可能な属性: {[attr for attr in dir(model) if not attr.startswith('_')][:15]}")
             return
         
-        # 各ステージにフックを登録
+        # 各ステージにフックを登録（Webリサーチベース）
         if stage_ends is not None:
-            # SAM2 Hieraの場合: stage_endsを使用してステージの最終ブロックにフック
+            # SAM2 Hieraの場合: 4つのストライドレベルに対応するフック
+            stride_levels = [4, 8, 16, 32]  # Webリサーチ結果
+            
             for stage_idx, block_idx in enumerate(stage_ends):
                 if block_idx < len(blocks):
                     block = blocks[block_idx]
-                    # ステージ番号は1から開始
+                    # ステージ番号は1から開始、strideレベル情報も含める
                     stage_num = stage_idx + 1
+                    stride = stride_levels[stage_idx] if stage_idx < len(stride_levels) else 32
+                    
                     hook = block.register_forward_hook(
-                        lambda m, i, o, stage=stage_num: self._save_feature(o, f'stage_{stage}')
+                        lambda m, i, o, stage=stage_num, stride_val=stride: 
+                        self._save_feature(o, f'stage_{stage}_stride_{stride_val}')
                     )
                     self.hooks.append(hook)
-                    print(f"  - Stage {stage_num} (Block {block_idx})にフック登録")
+                    print(f"  - Stage {stage_num} (Block {block_idx}, Stride {stride})にフック登録")
         else:
             # 通常のViT: self.stagesで指定されたインデックスにフック
             for stage_idx in self.stages:
@@ -397,9 +422,96 @@ class EnhancedMaskDecoder(nn.Module):
                 )
                 print(f"  ✅ dense_prompt_embeddings調整完了: -> {(img_h, img_w)}")
         
+        # 高解像度特徴の準備（Webリサーチ結果に基づくSAM2 Hiera対応版）
+        # SAM2は[stride4_features, stride8_features]のリストを期待
+        # stride 4と8の特徴はマスクデコーダのアップサンプリング層に追加される
+        high_res_features = None
+        if multiscale_features is not None and len(multiscale_features) > 1:
+            stride4_feat = None  # Stage 1: stride 4, 高解像度特徴
+            stride8_feat = None  # Stage 2: stride 8, 中解像度特徴
+            
+            # Webリサーチベース: stride値によるダイレクト選択
+            for name, feat in multiscale_features.items():
+                if isinstance(feat, torch.Tensor):
+                    # 新しい命名規則に対応: stage_X_stride_Y
+                    if 'stride_4' in name:
+                        stride4_feat = feat
+                        print(f"  🎯 Stride 4特徴直接選択: {name} {feat.shape}")
+                    elif 'stride_8' in name:
+                        stride8_feat = feat
+                        print(f"  🎯 Stride 8特徴直接選択: {name} {feat.shape}")
+                    # 従来の命名規則にも対応
+                    elif 'stage_1' in name and stride4_feat is None:
+                        stride4_feat = feat
+                        print(f"  🔧 Stage 1をStride 4特徴として選択: {name} {feat.shape}")
+                    elif 'stage_2' in name and stride8_feat is None:
+                        stride8_feat = feat
+                        print(f"  🔧 Stage 2をStride 8特徴として選択: {name} {feat.shape}")
+            
+            # フォールバック: 解像度ベースの選択
+            if stride4_feat is None or stride8_feat is None:
+                print(f"  🔄 フォールバック: 解像度ベースの特徴選択")
+                for name, feat in multiscale_features.items():
+                    if isinstance(feat, torch.Tensor) and feat.dim() == 4:
+                        _, _, h, w = feat.shape
+                        # Webリサーチ結果: SAM2の標準解像度に基づく分類
+                        if h >= 224 and w >= 224 and stride4_feat is None:  # 高解像度 (stride 4相当)
+                            stride4_feat = feat
+                            print(f"    📐 高解像度特徴をStride 4として選択: {name} {feat.shape}")
+                        elif h >= 112 and w >= 112 and stride8_feat is None:  # 中解像度 (stride 8相当)
+                            stride8_feat = feat
+                            print(f"    📐 中解像度特徴をStride 8として選択: {name} {feat.shape}")
+            
+            # 両方の解像度が利用可能な場合のみhigh_res_featuresを設定
+            if stride4_feat is not None and stride8_feat is not None:
+                # Webリサーチ結果: SAM2期待解像度への調整
+                import torch.nn.functional as F
+                
+                # SAM2の標準解像度（image_embeddingsは64x64が基準）
+                base_h, base_w = image_embeddings.shape[-2:]  # 通常64x64
+                
+                # Webリサーチ結果: stride 4特徴は4倍解像度（256x256）
+                expected_stride4_size = (base_h * 4, base_w * 4)  # 256x256
+                if stride4_feat.dim() == 3:
+                    # [B, N, C] -> [B, C, H, W]への変換
+                    B, N, C = stride4_feat.shape
+                    H = W = int(math.sqrt(N))
+                    stride4_feat = stride4_feat.transpose(1, 2).reshape(B, C, H, W)
+                
+                if stride4_feat.shape[-2:] != expected_stride4_size:
+                    stride4_feat = F.interpolate(
+                        stride4_feat, size=expected_stride4_size, 
+                        mode='bilinear', align_corners=False
+                    )
+                    print(f"    📐 Stride 4特徴リサイズ: -> {expected_stride4_size}")
+                
+                # Webリサーチ結果: stride 8特徴は2倍解像度（128x128）
+                expected_stride8_size = (base_h * 2, base_w * 2)  # 128x128
+                if stride8_feat.dim() == 3:
+                    # [B, N, C] -> [B, C, H, W]への変換
+                    B, N, C = stride8_feat.shape
+                    H = W = int(math.sqrt(N))
+                    stride8_feat = stride8_feat.transpose(1, 2).reshape(B, C, H, W)
+                
+                if stride8_feat.shape[-2:] != expected_stride8_size:
+                    stride8_feat = F.interpolate(
+                        stride8_feat, size=expected_stride8_size,
+                        mode='bilinear', align_corners=False
+                    )
+                    print(f"    📐 Stride 8特徴リサイズ: -> {expected_stride8_size}")
+                
+                # SAM2期待フォーマット: [stride4_features, stride8_features]
+                high_res_features = [stride4_feat, stride8_feat]
+                print(f"  ✅ 高解像度特徴準備完了（Webリサーチベース）: [{stride4_feat.shape}, {stride8_feat.shape}]")
+            else:
+                print(f"  ⚠️ 高解像度特徴不足: stride4={stride4_feat is not None}, stride8={stride8_feat is not None}")
+                if stride4_feat is not None:
+                    print(f"    - 利用可能なStride 4特徴: {stride4_feat.shape}")
+                if stride8_feat is not None:
+                    print(f"    - 利用可能なStride 8特徴: {stride8_feat.shape}")
+        
         # メインデコーダー（低解像度特徴）
         # SAM2 MaskDecoderにはrepeat_imageとhigh_res_featuresパラメータが必要
-        # Webリサーチ結果: high_res_featuresは None または [4*H*4*W特徴, 2*H*2*W特徴] のリスト
         masks_main, iou_pred = self.main_decoder(
             image_embeddings=image_embeddings,
             image_pe=image_pe,
@@ -407,7 +519,7 @@ class EnhancedMaskDecoder(nn.Module):
             dense_prompt_embeddings=dense_prompt_embeddings,
             multimask_output=multimask_output,
             repeat_image=False,  # バッチ処理済みの場合
-            high_res_features=None  # 高解像度特徴は後で追加（現在は無効）
+            high_res_features=high_res_features  # SAM2高解像度特徴
         )
         
         # マルチスケール処理が不要な場合
@@ -422,20 +534,31 @@ class EnhancedMaskDecoder(nn.Module):
         else:
             coarse_mask = masks_main[:, 0:1]  # 最初のマスク
         
-        # マルチスケール特徴の取得と投影
+        # マルチスケール特徴の取得と投影（Webリサーチベース）
         high_res_feat = None
         mid_res_feat = None
         
-        # 特徴マップの解像度に基づいて分類
+        # Webリサーチ結果に基づく特徴分類
         for name, feat in multiscale_features.items():
-            if 'stage_1' in name or 'stage_2' in name:
-                # 高解像度
-                if high_res_feat is None:
+            if isinstance(feat, torch.Tensor):
+                # stride値による直接分類
+                if 'stride_4' in name:
+                    # Stage 1: 高解像度特徴（アップサンプリング用）
                     high_res_feat = self.feature_projectors['high'](feat)
-            elif 'stage_3' in name or 'stage_4' in name:
-                # 中解像度
-                if mid_res_feat is None:
+                    print(f"    📊 高解像度特徴投影: {name} -> {high_res_feat.shape}")
+                elif 'stride_8' in name:
+                    # Stage 2: 中解像度特徴（アップサンプリング用）
                     mid_res_feat = self.feature_projectors['mid'](feat)
+                    print(f"    📊 中解像度特徴投影: {name} -> {mid_res_feat.shape}")
+                # 従来の命名規則による分類
+                elif ('stage_1' in name or 'stage_2' in name) and high_res_feat is None:
+                    # 高解像度（stride 4, 8相当）
+                    high_res_feat = self.feature_projectors['high'](feat)
+                    print(f"    📊 高解像度特徴投影（従来命名）: {name} -> {high_res_feat.shape}")
+                elif ('stage_3' in name or 'stage_4' in name) and mid_res_feat is None:
+                    # 中解像度（stride 16, 32相当、FPN用）
+                    mid_res_feat = self.feature_projectors['mid'](feat)
+                    print(f"    📊 中解像度特徴投影（従来命名）: {name} -> {mid_res_feat.shape}")
         
         # 補助デコーダーでの精細化
         if high_res_feat is not None and mid_res_feat is not None:

@@ -509,37 +509,49 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
         sam_prompts = qformer_outputs['sam_prompts']  # [B, 32, 256]
         
         if self.enable_multiscale:
-            # マルチスケールマスク生成（デバッグ修正: 一時的に通常処理にフォールバック）
-            print(f"⚠️ マルチスケールマスク生成: 現在調整中、通常処理を使用")
+            # マルチスケールマスク生成（高解像度特徴対応版）
+            print(f"🔍 マルチスケールマスク生成: 高解像度特徴活用")
             
-            # マルチスケールが無効の場合と同じ処理を実行
-            if hasattr(self.segmentation_head, 'sam_wrapper'):
-                # MultiScaleSegmentationHeadのsam_wrapperを使用
-                sam_wrapper = self.segmentation_head.sam_wrapper
-            else:
-                sam_wrapper = self.segmentation_head
-                
-            if hasattr(sam_wrapper, 'predict_with_prompts'):
-                # SAM2の場合
-                sam_wrapper.set_image(images)
-                
-                outputs_dict = sam_wrapper.predict_with_prompts(
-                    prompt_embeddings=sam_prompts,
-                    point_coords=None,
-                    point_labels=None,
-                    boxes=None,
+            try:
+                masks, iou_scores, _ = self.segmentation_head(
+                    images=images,
+                    visual_context=separated_outputs['visual_features'],
                     multimask_output=True
                 )
+                print(f"  ✅ マルチスケールマスク生成成功: {masks.shape}")
                 
-                masks = outputs_dict['masks']
-                if masks.dim() == 3:
-                    masks = masks.unsqueeze(0)
-                iou_scores = outputs_dict['iou_predictions']
-                if iou_scores.dim() == 1:
-                    iou_scores = iou_scores.unsqueeze(0)
-            else:
-                # フォールバック
-                raise RuntimeError("マルチスケール処理のフォールバックに失敗しました")
+            except Exception as ms_error:
+                print(f"  ❌ マルチスケールマスク生成エラー: {str(ms_error)}")
+                print(f"    - エラータイプ: {type(ms_error).__name__}")
+                
+                # フォールバック: 通常のSAM2処理
+                print(f"  🔄 フォールバック: 通常SAM2処理")
+                if hasattr(self.segmentation_head, 'sam_wrapper'):
+                    sam_wrapper = self.segmentation_head.sam_wrapper
+                elif hasattr(self.segmentation_head, 'predictor'):
+                    # 直接SAM2Wrapperとして扱う
+                    sam_wrapper = self.segmentation_head
+                else:
+                    raise RuntimeError("フォールバック用のSAM2Wrapperが見つかりません")
+                    
+                if hasattr(sam_wrapper, 'predict_with_prompts'):
+                    sam_wrapper.set_image(images)
+                    outputs_dict = sam_wrapper.predict_with_prompts(
+                        prompt_embeddings=sam_prompts,
+                        point_coords=None,
+                        point_labels=None,
+                        boxes=None,
+                        multimask_output=True
+                    )
+                    
+                    masks = outputs_dict['masks']
+                    if masks.dim() == 3:
+                        masks = masks.unsqueeze(0)
+                    iou_scores = outputs_dict['iou_predictions']
+                    if iou_scores.dim() == 1:
+                        iou_scores = iou_scores.unsqueeze(0)
+                else:
+                    raise RuntimeError("SAM2予測メソッドが見つかりません")
         else:
             # 通常のマスク生成
             # マルチスケールが無効の場合、self.segmentation_head自体がSAM2Wrapper

@@ -376,7 +376,7 @@ def inject_lora_to_model(
     router_config: Optional[Dict[str, Any]] = None
 ) -> nn.Module:
     """
-    モデルの指定モジュールにLoRAを注入
+    モデルの指定モジュールにLoRAを注入（デバッグ修正ルール対応）
     
     Args:
         model: 対象モデル
@@ -391,58 +391,116 @@ def inject_lora_to_model(
     Returns:
         LoRA適用済みモデル
     """
+    print(f"🔍 LoRA注入開始デバッグ:")
+    print(f"  - 対象モデル: {type(model).__name__}")
+    print(f"  - ターゲットモジュール: {target_modules}")
+    print(f"  - ランク: {rank}, アルファ: {alpha}")
+    print(f"  - MoE使用: {use_moe}, エキスパート数: {num_experts}")
+    
+    # GPU メモリ状況確認
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"  - GPU メモリ (注入前): Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
     
     # モジュール名とモジュールのマッピングを作成
     modules_to_replace = []
+    all_linear_modules = []
+    
     for name, module in model.named_modules():
+        # 全Linearモジュールを記録（デバッグ用）
+        if isinstance(module, nn.Linear):
+            all_linear_modules.append(name)
+        
         # ターゲットモジュールに一致するか確認
         for target in target_modules:
             if target in name and isinstance(module, nn.Linear):
                 modules_to_replace.append((name, module))
+                print(f"  ✅ ターゲット発見: {name} -> {module}")
                 break
     
-    # LoRAの注入
-    for name, module in modules_to_replace:
-        # モジュールパスを分解
-        parent_name = '.'.join(name.split('.')[:-1])
-        child_name = name.split('.')[-1]
-        parent = model
-        
-        # 親モジュールを取得
-        if parent_name:
-            for part in parent_name.split('.'):
-                parent = getattr(parent, part)
-        
-        # LoRAモジュールで置換
-        if use_moe:
-            # MoE LoRA
-            lora_module = LoRAExpertMoE(
-                base_layer=module,
-                num_experts=num_experts,
-                rank=rank,
-                alpha=alpha,
-                dropout=dropout,
-                router_config=router_config
-            )
-        else:
-            # 単一LoRA
-            lora_module = LoRALinear(
-                in_features=module.in_features,
-                out_features=module.out_features,
-                rank=rank,
-                alpha=alpha,
-                dropout=dropout,
-                bias=module.bias is not None
-            )
-            
-            # 元の重みをコピー
-            lora_module.weight.data = module.weight.data.clone()
-            if module.bias is not None:
-                lora_module.bias.data = module.bias.data.clone()
-        
-        # モジュールを置換
-        setattr(parent, child_name, lora_module)
-        print(f"✅ LoRA注入: {name}")
+    print(f"  - 全Linearモジュール数: {len(all_linear_modules)}")
+    print(f"  - LoRA注入対象数: {len(modules_to_replace)}")
     
-    print(f"✅ LoRA注入完了: {len(modules_to_replace)}個のモジュール")
+    if len(modules_to_replace) == 0:
+        print(f"  ⚠️ LoRA注入対象が見つかりません")
+        print(f"  - 利用可能なLinearモジュール（最初の10個）:")
+        for name in all_linear_modules[:10]:
+            print(f"    - {name}")
+        if len(all_linear_modules) > 10:
+            print(f"    - ... 他{len(all_linear_modules)-10}個")
+        return model
+    
+    # LoRAの注入（メモリ安全処理付き）
+    injection_count = 0
+    for i, (name, module) in enumerate(modules_to_replace):
+        print(f"  🔧 LoRA注入中 ({i+1}/{len(modules_to_replace)}): {name}")
+        
+        try:
+            # GPU メモリ状況を定期チェック
+            if torch.cuda.is_available() and i % 5 == 0:
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                if allocated > 70:  # 70GB以上の場合は警告
+                    print(f"    ⚠️ 高メモリ使用量: {allocated:.2f}GB")
+                    torch.cuda.empty_cache()  # キャッシュクリア
+            
+            # モジュールパスを分解
+            parent_name = '.'.join(name.split('.')[:-1])
+            child_name = name.split('.')[-1]
+            parent = model
+            
+            # 親モジュールを取得
+            if parent_name:
+                for part in parent_name.split('.'):
+                    parent = getattr(parent, part)
+            
+            # LoRAモジュールで置換
+            if use_moe:
+                # MoE LoRA
+                lora_module = LoRAExpertMoE(
+                    base_layer=module,
+                    num_experts=num_experts,
+                    rank=rank,
+                    alpha=alpha,
+                    dropout=dropout,
+                    router_config=router_config
+                )
+            else:
+                # 単一LoRA
+                lora_module = LoRALinear(
+                    in_features=module.in_features,
+                    out_features=module.out_features,
+                    rank=rank,
+                    alpha=alpha,
+                    dropout=dropout,
+                    bias=module.bias is not None
+                )
+                
+                # 元の重みをコピー（デバイス同期）
+                target_device = next(module.parameters()).device
+                lora_module = lora_module.to(target_device)
+                
+                with torch.no_grad():
+                    lora_module.weight.data.copy_(module.weight.data)
+                    if module.bias is not None:
+                        lora_module.bias.data.copy_(module.bias.data)
+            
+            # モジュールを置換
+            setattr(parent, child_name, lora_module)
+            injection_count += 1
+            print(f"    ✅ 注入完了: {name}")
+            
+        except Exception as e:
+            print(f"    ❌ LoRA注入エラー ({name}): {str(e)}")
+            print(f"      - エラータイプ: {type(e).__name__}")
+            # エラーが発生しても続行（デバッグ修正ルール）
+            continue
+    
+    # 最終メモリ状況
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"  - GPU メモリ (注入後): Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+    
+    print(f"✅ LoRA注入完了: {injection_count}/{len(modules_to_replace)}個のモジュール")
     return model
