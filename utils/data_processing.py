@@ -10,8 +10,12 @@ from typing import Dict, List, Any
 
 class DataCollatorForSupervisedDataset:
     """
-    Llama-4多モーダルモデル対応のデータコレーター
-    バッチ処理とパディングを担当
+    Llama-4多モーダルモデル対応のデータコレーター（2025年更新版）
+    HybridDataset互換のバッチ処理とパディングを担当
+    
+    更新内容:
+    - 新しいデータ構造に対応（pixel_values, sam_pixel_values）
+    - 正規化されたテンソル形状に対応
     """
     def __init__(self, tokenizer, pad_to_multiple_of=None):
         self.tokenizer = tokenizer
@@ -19,14 +23,14 @@ class DataCollatorForSupervisedDataset:
         
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """
-        バッチデータの処理
+        バッチデータの処理（2025年HybridDataset互換）
         """
-        # 入力データの抽出
+        # 入力データの抽出（新しい命名規則）
         input_ids_list = []
         attention_mask_list = []
         labels_list = []
-        images_sam_list = []
-        images_llama_list = []
+        sam_pixel_values_list = []
+        pixel_values_list = []
         masks_list = []
         
         for item in batch:
@@ -36,17 +40,25 @@ class DataCollatorForSupervisedDataset:
                 attention_mask_list.append(item['attention_mask'])
             if 'labels' in item:
                 labels_list.append(item['labels'])
-            if 'images_for_sam' in item:
-                images_sam_list.append(item['images_for_sam'])
-            if 'images_for_llama' in item:
-                images_llama_list.append(item['images_for_llama'])
+            
+            # 🔧 新しいデータ構造に対応
+            if 'sam_pixel_values' in item:
+                sam_pixel_values_list.append(item['sam_pixel_values'])
+            elif 'images_for_sam' in item:  # 後方互換性
+                sam_pixel_values_list.append(item['images_for_sam'])
+                
+            if 'pixel_values' in item:
+                pixel_values_list.append(item['pixel_values'])
+            elif 'images_for_llama' in item:  # 後方互換性
+                pixel_values_list.append(item['images_for_llama'])
+                
             if 'ground_truth_mask' in item:
                 masks_list.append(item['ground_truth_mask'])
         
         # パディング処理
         batch_output = {}
         
-        # テキストのパディング
+        # テキストのパディング（既存ロジック維持）
         if input_ids_list:
             padded = self.tokenizer.pad(
                 {'input_ids': input_ids_list},
@@ -76,13 +88,19 @@ class DataCollatorForSupervisedDataset:
                         padded_labels.append(labels[:max_len])
                 batch_output['labels'] = torch.stack(padded_labels)
         
-        # 画像のスタック
-        if images_sam_list:
-            batch_output['images_for_sam'] = torch.stack(images_sam_list)
-        if images_llama_list:
-            batch_output['images_for_llama'] = torch.stack(images_llama_list)
+        # 🔧 画像のスタック（新しい命名規則）
+        if sam_pixel_values_list:
+            batch_output['sam_pixel_values'] = torch.stack(sam_pixel_values_list)
+        if pixel_values_list:
+            batch_output['pixel_values'] = torch.stack(pixel_values_list)
         if masks_list:
             batch_output['masks'] = torch.stack(masks_list)
+        
+        # 🔧 後方互換性の別名追加
+        if 'sam_pixel_values' in batch_output:
+            batch_output['images_for_sam'] = batch_output['sam_pixel_values']
+        if 'pixel_values' in batch_output:
+            batch_output['images_for_llama'] = batch_output['pixel_values']
         
         return batch_output
 

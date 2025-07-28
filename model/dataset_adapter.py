@@ -70,7 +70,7 @@ def adapt_dataset_for_qformer(batch: Dict[str, Any]) -> Dict[str, Any]:
     
     # デュアルエンコーダー構成：両方の画像を適切にマッピング
     if 'pixel_values' in batch and 'sam_pixel_values' in batch:
-        # Llama-4用画像
+        # Llama-4用画像（AutoProcessorで標準処理済み）
         adapted_batch['images'] = batch['pixel_values']
         # SAM2用画像
         adapted_batch['sam_images'] = batch['sam_pixel_values']

@@ -22,7 +22,12 @@
 ## 今後の作業計画
 
 ### Phase 1: 学習機能の検証 【最優先】
-1. **train_phase3b_qformer_bridge.pyでテスト学習**
+1. **train_phase3b_enhanced.pyの作成**
+   - test_phase3b_enhanced_multiscale_lora.pyで使用しているEnhancedQFormerSegmentationBridgeモデルを使用
+   - train_phase3b_qformer_bridge.pyの学習ループ構造を参考に実装
+   - 現在無効化している機能（LoRA、マルチスケール、高解像度特徴）はそのまま維持
+
+2. **テスト学習の実行**
    - 小規模データでの動作確認
    - 勾配フローの確認
    - 損失減少の確認

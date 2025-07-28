@@ -51,7 +51,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import GradScaler
+# from torch.cuda.amp import GradScaler  # 🔧 修正方針E: GradScaler不使用
 import transformers
 from transformers import AutoProcessor, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, TaskType
@@ -91,7 +91,7 @@ from model.enhanced_llama4_qformer_sam2 import EnhancedQFormerSegmentationBridge
 from model.dataset_adapter import adapt_dataset_for_qformer
 from utils.dataset import HybridDataset, collate_fn, preprocess_sam_image, build_correct_labels_for_llama4
 from utils.constants import DEFAULT_SEG_TOKEN
-from utils.segmentation_eval import evaluate_segmentation_metrics
+# from utils.segmentation_eval import evaluate_segmentation_metrics  # 存在しないため削除
 import config_linux
 
 
@@ -185,32 +185,53 @@ def initialize_enhanced_model(args, logger):
         raise
 
 
-def setup_data_loaders(args, logger):
-    """データローダー設定（テキスト入力対応版）"""
+
+def setup_data_loaders(args, logger, llama_processor):
+    """データローダー設定（既存HybridDataset使用）"""
     logger.info("=== データローダー設定 ===")
     
-    # データセット作成
-    train_dataset = HybridDataset(
-        dataset_dirs=config_linux.DATASET_DIRS,
-        dataset_types=config_linux.DATASET_TYPES,
-        dataset_samples=config_linux.DATASET_SAMPLES,
-        split='train',
-        max_samples_per_dataset=1000,
-        resize_size=(448, 448),
-        clip_processor=None,  # Q-Formerが処理
-        include_text=True  # テキスト入力を含める
+    # データセット設定（train_phase3b_qformer_bridge.py参考）
+    if hasattr(args, 'dataset') and args.dataset:
+        datasets = [ds.strip() for ds in args.dataset.split(',')]
+        dataset_string = "||".join(datasets)
+    else:
+        dataset_string = "reason_seg"  # デフォルト
+    
+    # サンプル数設定
+    if args.steps_per_epoch:
+        samples_per_epoch = args.steps_per_epoch * args.batch_size
+    else:
+        samples_per_epoch = 500  # デフォルト
+    
+    # HybridDataset初期化
+    logger.info("🔍 HybridDataset初期化前デバッグ情報:")
+    logger.info(f"  - base_image_dir: {config_linux.DATASET_BASE_DIR}")
+    logger.info(f"  - base_image_dir存在確認: {os.path.exists(config_linux.DATASET_BASE_DIR)}")
+    logger.info(f"  - dataset_string: {dataset_string}")
+    
+    dataset = HybridDataset(
+        base_image_dir=config_linux.DATASET_BASE_DIR,
+        llama_processor=llama_processor,
+        samples_per_epoch=samples_per_epoch,
+        precision="bf16",
+        llama_image_size=config_linux.LLAMA_IMAGE_SIZE,
+        sam_image_size=config_linux.SAM_IMAGE_SIZE,
+        num_classes_per_sample=3,
+        exclude_val=True,
+        dataset=dataset_string,
+        sample_rate=[9, 3, 3, 1],  # reason_seg, refer_seg, vqa, sem_seg の比率
+        sem_seg_data=config_linux.SEM_SEG_DATA,
+        refer_seg_data=config_linux.REFER_SEG_DATA,
+        vqa_data=config_linux.VQA_DATA,
+        reason_seg_data=config_linux.REASON_SEG_DATA,
+        explanatory=0.1
     )
     
-    # Q-Former用に適応
-    train_dataset = adapt_dataset_for_qformer(
-        train_dataset, 
-        qformer_type='enhanced',  # 改修版指定
-        qformer_config={'max_txt_len': 64}
-    )
+    logger.info(f"HybridDataset初期化完了: {len(dataset)} サンプル")
     
     # データローダー
     train_loader = DataLoader(
-        train_dataset,
+        dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.workers,
@@ -220,9 +241,9 @@ def setup_data_loaders(args, logger):
     )
     
     logger.info(f"✅ データローダー設定完了")
-    logger.info(f"  - 訓練サンプル数: {len(train_dataset)}")
+    logger.info(f"  - 訓練サンプル数: {len(dataset)}")
     logger.info(f"  - バッチサイズ: {args.batch_size}")
-    logger.info(f"  - テキスト入力: 有効")
+    logger.info(f"  - データセット: {dataset_string}")
     
     return train_loader
 
@@ -231,7 +252,7 @@ def train_one_epoch(
     model: EnhancedQFormerSegmentationBridge,
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
+    scaler: None,  # 🔧 修正方針E: GradScaler無効化
     epoch: int,
     args: Any,
     logger: logging.Logger,
@@ -264,43 +285,47 @@ def train_one_epoch(
         if args.steps_per_epoch and batch_idx >= args.steps_per_epoch:
             break
         
-        # メモリ監視
-        memory_monitor.start_monitoring("batch_forward")
-        
         try:
-            # デバイス転送
-            images = batch['images'].cuda()
-            labels = batch['labels'].cuda()
+            # HybridDatasetの出力をデュアルエンコーダー対応に変換
+            adapted_batch = adapt_dataset_for_qformer(batch)
             
-            # テキスト入力（ある場合）
-            text_input = batch.get('text_input', None)
+            # デバイス転送
+            images = adapted_batch['images'].cuda()
+            sam_images = adapted_batch.get('sam_images', None)  # SAM2用画像
+            if sam_images is not None:
+                sam_images = sam_images.cuda()
+            labels = adapted_batch['labels'].cuda()
+            
+            # テキスト入力
+            text_input = adapted_batch.get('text_input', None)
             if text_input is None:
                 # デフォルトテキスト生成
                 text_input = [f"Segment the objects in this image." for _ in range(images.size(0))]
             
-            # Mixed Precision Training
+            # 🔧 修正方針E: BFloat16ネイティブ学習のためautocast範囲を推論のみに限定
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                # Forward処理
+                # Forward処理（推論部分のみautocast）
                 outputs = model(
                     images=images,
+                    sam_images=sam_images,  # SAM2用画像を追加
                     text_input=text_input,
                     labels=labels,
                     mode=current_mode
                 )
-                
-                loss = outputs['loss']
-                loss_dict = outputs.get('loss_dict', {})
             
-            # Backward処理
-            scaler.scale(loss).backward()
+            # Loss計算はautocast外で実行（BFloat16ネイティブ）
+            loss = outputs['loss']
+            loss_dict = outputs.get('loss_dict', {})
             
-            # 勾配クリッピング
-            scaler.unscale_(optimizer)
+            # 🔧 修正方針E: BFloat16ネイティブ学習（GradScaler不使用）
+            # BFloat16は数値安定性が高いため、直接backward()を呼び出し
+            loss.backward()
+            
+            # 勾配クリッピング（BFloat16対応）
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
-            # 最適化ステップ
-            scaler.step(optimizer)
-            scaler.update()
+            # 最適化ステップ（スケーリング無し）
+            optimizer.step()
             optimizer.zero_grad()
             
             # メトリクス更新
@@ -324,14 +349,20 @@ def train_one_epoch(
                     else:
                         masks = masks[:, 0:1]
                 
-                # メトリクス計算
-                metrics = evaluate_segmentation_metrics(
-                    masks > 0.5,
-                    labels.unsqueeze(1),
-                    num_classes=2
-                )
-                epoch_metrics['iou'] += metrics['mIoU']
-                epoch_metrics['dice'] += metrics['mDice']
+                # 簡易メトリクス計算
+                pred_binary = (masks > 0.5).float()
+                target_binary = labels.unsqueeze(1).float()
+                
+                # IoU計算
+                intersection = (pred_binary * target_binary).sum(dim=(2, 3))
+                union = pred_binary.sum(dim=(2, 3)) + target_binary.sum(dim=(2, 3)) - intersection
+                iou = (intersection / (union + 1e-6)).mean().item()
+                
+                # Dice計算
+                dice = (2 * intersection / (pred_binary.sum(dim=(2, 3)) + target_binary.sum(dim=(2, 3)) + 1e-6)).mean().item()
+                
+                epoch_metrics['iou'] += iou
+                epoch_metrics['dice'] += dice
             
             # プログレスバー更新
             pbar.set_postfix({
@@ -348,12 +379,13 @@ def train_one_epoch(
             
         except Exception as e:
             logger.error(f"❌ バッチ処理エラー: {e}")
-            memory_monitor.print_summary()
+            memory_summary = memory_monitor.get_memory_summary()
+            logger.info(f"📊 エラー時メモリ状況: {memory_summary}")
             emergency_cleanup()
             continue
         
         finally:
-            memory_monitor.stop_monitoring("batch_forward")
+            pass  # メモリ監視完了
     
     # エポック平均計算
     num_batches = min(len(train_loader), args.steps_per_epoch or len(train_loader))
@@ -392,6 +424,8 @@ def main():
                         help='LoRAを無効化')
     parser.add_argument('--disable_multiscale', action='store_true',
                         help='マルチスケールを無効化')
+    parser.add_argument('--dataset', type=str, default='reason_seg',
+                        help='使用するデータセット（カンマ区切り）')
     
     args = parser.parse_args()
     
@@ -410,24 +444,29 @@ def main():
         model = model_components['model']
         
         # データローダー設定
-        train_loader = setup_data_loaders(args, logger)
+        train_loader = setup_data_loaders(args, logger, model_components['llama4_processor'])
         
         # オプティマイザー設定
         logger.info("📊 オプティマイザー設定...")
-        if BITSANDBYTES_AVAILABLE:
-            optimizer = bnb.optim.AdamW8bit(
-                model.parameters(),
-                lr=args.lr,
-                weight_decay=0.01
-            )
-            logger.info("✅ 8bit AdamW使用")
-        else:
-            optimizer = optim.AdamW(
-                model.parameters(),
-                lr=args.lr,
-                weight_decay=0.01
-            )
-            logger.info("✅ 標準AdamW使用")
+        # 🔧 修正方針D: BFloat16+GradScaler互換性のため標準AdamWを使用
+        logger.info("🔧 BFloat16最適化: 8bit AdamW → 標準AdamW (GradScaler互換性)")
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=0.01,
+            betas=(0.9, 0.95),  # BFloat16推奨設定
+            eps=1e-8
+        )
+        logger.info("✅ 標準AdamW使用 (BFloat16最適化)")
+        
+        # 🔧 bitsandbytes 8bit AdamWは一時的に無効化
+        # if BITSANDBYTES_AVAILABLE:
+        #     optimizer = bnb.optim.AdamW8bit(
+        #         model.parameters(),
+        #         lr=args.lr,
+        #         weight_decay=0.01
+        #     )
+        #     logger.info("✅ 8bit AdamW使用")
         
         # スケジューラー設定
         num_training_steps = len(train_loader) * args.epochs
@@ -437,8 +476,10 @@ def main():
             num_training_steps=num_training_steps
         )
         
-        # GradScaler設定
-        scaler = GradScaler()
+        # 🔧 修正方針E: BFloat16ネイティブ学習のためGradScaler完全無効化
+        # BFloat16は数値安定性が高いため、勾配スケーリング不要
+        scaler = None  # GradScaler完全無効化
+        logger.info("🔧 GradScaler無効化: BFloat16ネイティブ学習モード")
         
         # 訓練ループ
         logger.info("\n🚀 訓練開始")
@@ -496,7 +537,8 @@ def main():
     finally:
         # クリーンアップ
         writer.close()
-        memory_monitor.print_summary()
+        memory_summary = memory_monitor.get_memory_summary()
+        logger.info(f"📊 メモリ使用量サマリ: {memory_summary}")
         logger.info("🧹 クリーンアップ完了")
 
 

@@ -23,7 +23,7 @@ def test_dual_encoder_functions():
     
     try:
         # 1. 必要なモジュールのインポート
-        from utils.dataset import preprocess_sam_image, preprocess_llama_image, collate_fn
+        from utils.dataset import preprocess_sam_image, collate_fn
         from transformers import AutoProcessor, AutoTokenizer
         import config_linux
         

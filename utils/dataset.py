@@ -135,40 +135,8 @@ def preprocess_sam_image(image: Image.Image, target_size: Optional[int] = None) 
     
     return image_tensor
 
-def preprocess_llama_image(image: Image.Image, processor, target_size: int = 448) -> torch.Tensor:
-    """
-    Llama-4用画像前処理：ネイティブマルチモーダル対応
-    Llama-4 processorを使用して画像を処理
-    """
-    # Convert to RGB if necessary
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
-    
-    # Llama-4のプロセッサが画像処理を持っている場合
-    if hasattr(processor, 'image_processor') and processor.image_processor is not None:
-        # Llama-4プロセッサによる画像処理
-        processed = processor.image_processor(
-            images=image,
-            return_tensors="pt"
-        )
-        pixel_values = processed['pixel_values'].squeeze(0)
-    else:
-        # フォールバック：手動でリサイズと正規化
-        # リサイズ
-        image = image.resize((target_size, target_size), Image.Resampling.LANCZOS)
-        
-        # numpy配列に変換
-        image_np = np.array(image).astype(np.float32) / 255.0
-        
-        # CHW形式に変換
-        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).float()
-        
-        # ImageNet標準正規化
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        pixel_values = (image_tensor - mean) / std
-    
-    return pixel_values
+# preprocess_llama_image関数は削除済み
+# Meta公式推奨：AutoProcessorを直接使用してpixel_valuesの最初のパッチを選択
 
 def build_correct_labels_for_llama4(input_ids: torch.Tensor, tokenizer) -> torch.Tensor:
     """
@@ -436,7 +404,8 @@ class HybridDataset(torch.utils.data.Dataset):
                     raise ValueError(f"サポートされていない画像形式: {type(image_data)}")
             # デュアルエンコーダー構成：SAMとLlama両方の画像処理
             image_sam = preprocess_sam_image(image_pil, self.sam_image_size)
-            image_llama = preprocess_llama_image(image_pil, self.llama_processor, self.llama_image_size)
+            # Llama-4画像処理は後でAutoProcessorで実行（テキストと一緒に処理）
+            image_llama = None  # 後でAutoProcessorで処理
             # 元画像サイズを記録
             original_size = (image_pil.height, image_pil.width)
             resize = None
@@ -475,12 +444,8 @@ class HybridDataset(torch.utils.data.Dataset):
             
             # デュアルエンコーダー構成：SAMとLlama両方の画像処理を実行
             image_sam = preprocess_sam_image(image_pil, self.sam_image_size)
-            # Llama-4用画像処理（image_llamaが既に処理されている場合はスキップ）
-            if 'image_llama' in locals() and image_llama is not None:
-                # 既存のimage_llamaを使用
-                pass
-            else:
-                image_llama = preprocess_llama_image(image_pil, self.llama_processor, self.llama_image_size)
+            # Llama-4画像処理は後でAutoProcessorで実行（テキストと一緒に処理）
+            image_llama = None  # 後でAutoProcessorで処理
             # 元画像サイズを記録（マスク処理用）
             original_size = (image_pil.height, image_pil.width)
         else:
@@ -537,22 +502,27 @@ class HybridDataset(torch.utils.data.Dataset):
             input_ids = llama_inputs['input_ids'].squeeze(0)
             attention_mask = llama_inputs['attention_mask'].squeeze(0)
             
-            # pixel_valuesがある場合は取得、なければ既に処理済みのimage_llamaを使用
+            # Meta公式推奨：AutoProcessorのpixel_valuesを標準処理
             if 'pixel_values' in llama_inputs:
-                pixel_values = llama_inputs['pixel_values'].squeeze(0)
+                pixel_values_raw = llama_inputs['pixel_values']
+                # Llama-4のEarly Fusionアーキテクチャ：[10, 3, 336, 336] → 最初のパッチを選択
+                if pixel_values_raw.dim() == 4 and pixel_values_raw.size(0) == 10:
+                    pixel_values = pixel_values_raw[0]  # [3, 336, 336]
+                elif pixel_values_raw.dim() == 3:
+                    pixel_values = pixel_values_raw  # [3, 336, 336]
+                else:
+                    pixel_values = pixel_values_raw.squeeze(0)
             else:
-                pixel_values = image_llama
+                # AutoProcessorでpixel_valuesが取得できない場合
+                raise RuntimeError("AutoProcessorでpixel_valuesが取得できませんでした")
                 
         except Exception as e:
             print(f"❌ Llama-4マルチモーダル処理エラー: {e}")
-            print(f"   テキスト: {formatted_prompt[:100]}...")
             raise RuntimeError(f"Llama-4処理に失敗: {e}")
 
-        # デュアルエンコーダー構成：両方の画像を正しい形状に
+        # SAM2画像の最終形状確認
         if image_sam.dim() == 4:
             image_sam = image_sam.squeeze(0)
-        if pixel_values.dim() == 4:
-            pixel_values = pixel_values.squeeze(0)
 
         seg_token_mask = (input_ids == self.seg_token_idx)
         labels = build_correct_labels_for_llama4(input_ids, self.llama_processor.tokenizer)
@@ -585,6 +555,9 @@ class HybridDataset(torch.utils.data.Dataset):
         else:
             ground_truth_mask = None
 
+        print(f"🔥 [HybridDataset-return] 返却するpixel_values形状: {pixel_values.shape}")
+        print(f"🔥 [HybridDataset-return] 返却するsam_pixel_values形状: {image_sam.shape}")
+        
         return {
             'input_ids': input_ids,
             'labels': labels,
@@ -633,9 +606,10 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
     questions_list = []
     sampled_classes_list = []
     
-    for item in batch:
+    for idx, item in enumerate(batch):
         # デュアルエンコーダー構成: 両方の画像を収集
         if "pixel_values" in item:
+            print(f"🔍 [collate_fn] バッチ{idx} pixel_values形状: {item['pixel_values'].shape}")
             pixel_values.append(item["pixel_values"])
         sam_pixel_values.append(item["sam_pixel_values"])
         input_ids.append(item["input_ids"])
@@ -664,10 +638,15 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
     
     # デュアルエンコーダー構成: 両方の画像をスタック
     if pixel_values:
+        print(f"🔍 [collate_fn] stack前のpixel_values個数: {len(pixel_values)}")
+        print(f"🔍 [collate_fn] 各pixel_valuesの形状: {[pv.shape for pv in pixel_values]}")
         pixel_values = torch.stack(pixel_values)
+        print(f"🔍 [collate_fn] stack後のpixel_values形状: {pixel_values.shape}")
     else:
         # フォールバック：pixel_valuesがない場合はSAM画像から生成
+        print(f"🔍 [collate_fn] pixel_valuesなし、SAM画像から生成")
         pixel_values = torch.stack([F.interpolate(sam.unsqueeze(0), size=(448, 448), mode='bilinear').squeeze(0) for sam in sam_pixel_values])
+        print(f"🔍 [collate_fn] 生成後のpixel_values形状: {pixel_values.shape}")
     sam_pixel_values = torch.stack(sam_pixel_values)
     max_length = max(ids.size(0) for ids in input_ids)
     def pad_sequence(sequences, max_len, pad_value=0):

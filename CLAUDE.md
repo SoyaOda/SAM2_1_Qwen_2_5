@@ -12,11 +12,13 @@ o3によるリサーチは行わずwebでシンプルにリサーチすること
 md_filesを元に実装してきた（まだ未実装もあり）。
 
 [命令]
-まず、train_phase3b_qformer_bridge.pyで呼び出しているモデルや関連ファイルをよく読んで内容を理解して。
-モデルの根本的な設計を改修したい。md_files/current/o3-modification20250727.mdを参考に、修正を進めて。最終的に完成したモデルでtrain_phase3b_qformer_bridge.pyでテスト学習が完了できるようにすること。
+まず、train_phase3b_enhanced.pyで呼び出しているモデルや関連ファイルをよく読んで内容を理解して。
 
-※適宜webでllama4やSAM2の仕様、サンプルコード、ベストプラクティスを調べつつtodoや修正方針を作り、修正して 。
+md_files/todo/training_roadmap_20250127.mdを参考に、train_phase3b_enhanced.pyを実装中。
 
+※適宜webでllama4やSAM2の仕様、サンプルコード、ベストプラクティスを調べつつtodoや修正方針を作り、修正して 
+
+※フォールバック的なコードやダミーコードはエラーを隠蔽するので、シンプルにエラーを出して止めるように実装すること
 
 
 
