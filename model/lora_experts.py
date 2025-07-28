@@ -397,26 +397,32 @@ class LoRAExpertMoE(nn.Module):
         # エキスパート出力をスタック: [num_experts, *expert_output.shape]
         expert_outputs = torch.stack(expert_outputs, dim=0)  # [num_experts, ...]
         
-        # routing_weightsの形状確認とデバッグ
+        # デバッグ: 形状確認（初回のみ）
+        if not hasattr(self, '_debug_printed'):
+            print(f"  🔍 LoRAExpertMoE形状デバッグ:")
+            print(f"    - x.shape: {x.shape}")
+            print(f"    - base_output.shape: {base_output.shape}")
+            print(f"    - expert_outputs.shape: {expert_outputs.shape}")
+            print(f"    - routing_weights.shape: {routing_weights.shape}")
+            self._debug_printed = True
+        
+        # routing_weightsの形状確認
         # routing_weights: [B, num_experts] or [1, num_experts]
-        batch_size = routing_weights.shape[0]
+        # expert_outputs: [num_experts, B, out_features]
         
-        # routing_weightsを正しい形状に変換
-        if batch_size == 1:
-            # 単一入力の場合: [1, num_experts] -> [num_experts]
-            weights = routing_weights.squeeze(0)  # [num_experts]
+        # 重み付き結合を正しく実装
+        if routing_weights.dim() == 2:
+            # routing_weights: [B, num_experts] -> [B, num_experts, 1]
+            weights = routing_weights.unsqueeze(-1)  # [B, num_experts, 1]
+            # expert_outputs: [num_experts, B, out_features] -> [B, num_experts, out_features]
+            expert_outputs_permuted = expert_outputs.permute(1, 0, 2)  # [B, num_experts, out_features]
+            # 重み付き和: [B, num_experts, out_features] * [B, num_experts, 1] -> [B, out_features]
+            combined_lora = (expert_outputs_permuted * weights).sum(dim=1)  # [B, out_features]
         else:
-            # バッチ入力の場合: [B, num_experts] -> [num_experts, B] -> バッチ平均
-            weights = routing_weights.mean(dim=0)  # [num_experts] 
-        
-        # 重み付き結合：アインシュタイン記法を使用
-        # expert_outputs: [num_experts, ...], weights: [num_experts]
-        # 重みを適切に拡張してブロードキャスト
-        for _ in range(expert_outputs.dim() - 1):
-            weights = weights.unsqueeze(-1)  # [num_experts, 1, 1, ...]
-        
-        # 重み付き平均
-        combined_lora = (expert_outputs * weights).sum(dim=0)
+            # フォールバック（想定外の形状）
+            print(f"  ⚠️ 想定外のrouting_weights形状: {routing_weights.shape}")
+            # エキスパートの平均を使用
+            combined_lora = expert_outputs.mean(dim=0)
         
         # ベース出力とLoRA補正を結合
         return base_output + combined_lora

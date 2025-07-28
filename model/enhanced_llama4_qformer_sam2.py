@@ -109,7 +109,7 @@ class EnhancedLlamaQFormerSAM2Config:
             'rank': 16,
             'alpha': 16.0,
             'dropout': 0.1,
-            'target_modules': ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'qkv'],  # Hiera Attention層対応（proj除外：特殊層エラー回避）
+            'target_modules': [],  # LoRA無効化（メモリ爆発回避のため一時的に無効）
             'use_moe': True,        # MoE使用
             'num_experts': 2,       # RGB, Depth等
         }
@@ -504,8 +504,9 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
                 # 画像データとプロンプト準備
                 image_tensor = images[batch_idx]  # (3, H, W)
                 # SAM2はnumpy入力想定（HWC形式）
-                image_np = image_tensor.permute(1, 2, 0).cpu().numpy()  # (H, W, 3)
-                prompts_np = sam_prompts[batch_idx].detach().cpu().numpy()  # (32, 256)
+                # bfloat16はnumpyでサポートされないためfloat32に変換
+                image_np = image_tensor.permute(1, 2, 0).cpu().float().numpy()  # (H, W, 3)
+                prompts_np = sam_prompts[batch_idx].detach().cpu().float().numpy()  # (32, 256)
                 try:
                     # ① SAM2でマスク予測（coarseマスク群取得）
                     sam_wrapper.set_image(image_np)
@@ -521,71 +522,80 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
                     if iou_preds is not None:
                         print(f"  iou_predictions: {iou_preds.shape}, 平均IoU: {iou_preds.mean().item():.3f}")
                     # ② マルチスケール特徴抽出（高解像度特徴でマスク精緻化）
-                    print(f"  高解像度特徴抽出開始")
-                    sam_model = sam_wrapper.model  # SAM2モデル
-                    feat1 = feat2 = None
-                    x = image_tensor.unsqueeze(0).to(sam_wrapper._target_device)
-                    with torch.no_grad():
-                        # Hiera ViTの中間特徴抽出（stage1=stride4, stage2=stride8）
-                        for idx, blk in enumerate(sam_model.image_encoder.trunk.blocks):
-                            x = blk(x)
-                            if idx == 1:
-                                feat1 = x  # stage1 (stride4) - 高解像度
-                            if idx == 7:
-                                feat2 = x  # stage2 (stride8) - 中解像度
-                    if feat1 is None or feat2 is None:
-                        raise RuntimeError("必要な中間特徴が取得できません")
-                    print(f"  抽出特徴: stage1 {feat1.shape}, stage2 {feat2.shape}")
-                    # FP16/BF16対応: 特徴量をSAM2 dtypeに変換
-                    target_dtype = self.config.torch_dtype if isinstance(self.config.torch_dtype, torch.dtype) else getattr(torch, str(self.config.torch_dtype), torch.bfloat16)
-                    feat1 = feat1.to(target_dtype)
-                    feat2 = feat2.to(target_dtype)
-                    # ③ 高解像度特徴精緻化処理
-                    stage1_proj = self.conv_stage1(feat1)  # (1,64,112,112)
-                    stage2_proj = self.conv_stage2(feat2)  # (1,64,56,56)
-                    # 空間解像度リサイズ
-                    stage1_up = F.interpolate(stage1_proj, size=(256, 256), mode='bilinear', align_corners=False)
-                    stage2_up = F.interpolate(stage2_proj, size=(128, 128), mode='bilinear', align_corners=False)
-                    print(f"  特徴リサイズ: stage1 -> (256, 256), stage2 -> (128, 128)")
-                    # 各提案マスクに対して精緻化処理を適用
-                    refined_masks = []
-                    for m in range(masks.shape[0]):
-                        # 通常3提案
-                        coarse_mask = masks[m]  # (H, W)
-                        coarse_mask_t = coarse_mask.to(target_dtype)
-                        # coarse maskを高解像度特徴の解像度にダウンサンプル
-                        coarse_mask_128 = F.interpolate(
-                            coarse_mask_t.unsqueeze(0).unsqueeze(0),
-                            size=(128, 128),
-                            mode='bilinear',
-                            align_corners=False
-                        )
-                        # Stage2レベルでマスク精緻化
-                        inp2 = torch.cat([coarse_mask_128, stage2_up], dim=1)  # (1, 65, 128, 128)
-                        refine1_mask = self.refine1_net(inp2)  # (1,1,128,128)
-                        # Stage1レベルでさらに精緻化
-                        inp1 = torch.cat([
-                            F.interpolate(refine1_mask, size=(256, 256), mode='bilinear', align_corners=False),
-                            stage1_up
-                        ], dim=1)  # (1, 65, 256,256)
-                        refine2_mask = self.refine2_net(inp1)  # (1,1,256,256)
-                        # 最終マスクを元解像度にアップサンプル 
-                        final_mask = F.interpolate(
-                            refine2_mask,
-                            size=(coarse_mask.shape[-2], coarse_mask.shape[-1]),
-                            mode='bilinear',
-                            align_corners=False
-                        )  # (1,1,H,W)
-                        final_mask = torch.sigmoid(final_mask)  # (1,1,H,W) [0,1]に正規化
-                        refined_masks.append(final_mask.squeeze(0))  # (1,H,W)
-                        # デバッグ: マスク値範囲
-                        fm = final_mask.squeeze(0)
-                        print(f"  提案{m+1}精緻化マスク統計: min={float(fm.min()):.6f}, max={float(fm.max()):.6f}, mean={float(fm.mean()):.6f}")
-                    refined_masks = torch.stack(refined_masks, dim=0)  # (3, H, W)
-                    print(f"  ✅ マルチスケールマスク生成成功: 精緻化マスク{refined_masks.shape}")
-                    predicted_masks.append(refined_masks.to(device))
-                    if iou_preds is not None:
-                        iou_predictions.append(iou_preds.to(device))
+                    # 一時的に無効化（LayerNormエラー回避）
+                    if False:
+                        print(f"  高解像度特徴抽出開始")
+                        if not hasattr(sam_wrapper.predictor, 'model'):
+                            raise AttributeError("SAM2Wrapper.predictor.modelが見つかりません")
+                        sam_model = sam_wrapper.predictor.model  # SAM2モデル
+                        feat1 = feat2 = None
+                        x = image_tensor.unsqueeze(0).to(sam_wrapper._target_device)
+                        with torch.no_grad():
+                            # Hiera ViTの中間特徴抽出（stage1=stride4, stage2=stride8）
+                            for idx, blk in enumerate(sam_model.image_encoder.trunk.blocks):
+                                x = blk(x)
+                                if idx == 1:
+                                    feat1 = x  # stage1 (stride4) - 高解像度
+                                if idx == 7:
+                                    feat2 = x  # stage2 (stride8) - 中解像度
+                        if feat1 is None or feat2 is None:
+                            raise RuntimeError("必要な中間特徴が取得できません")
+                        print(f"  抽出特徴: stage1 {feat1.shape}, stage2 {feat2.shape}")
+                        # FP16/BF16対応: 特徴量をSAM2 dtypeに変換
+                        target_dtype = self.config.torch_dtype if isinstance(self.config.torch_dtype, torch.dtype) else getattr(torch, str(self.config.torch_dtype), torch.bfloat16)
+                        feat1 = feat1.to(target_dtype)
+                        feat2 = feat2.to(target_dtype)
+                        # ③ 高解像度特徴精緻化処理
+                        stage1_proj = self.conv_stage1(feat1)  # (1,64,112,112)
+                        stage2_proj = self.conv_stage2(feat2)  # (1,64,56,56)
+                        # 空間解像度リサイズ
+                        stage1_up = F.interpolate(stage1_proj, size=(256, 256), mode='bilinear', align_corners=False)
+                        stage2_up = F.interpolate(stage2_proj, size=(128, 128), mode='bilinear', align_corners=False)
+                        print(f"  特徴リサイズ: stage1 -> (256, 256), stage2 -> (128, 128)")
+                        # 各提案マスクに対して精緻化処理を適用
+                        refined_masks = []
+                        for m in range(masks.shape[0]):
+                            # 通常3提案
+                            coarse_mask = masks[m]  # (H, W)
+                            coarse_mask_t = coarse_mask.to(target_dtype)
+                            # coarse maskを高解像度特徴の解像度にダウンサンプル
+                            coarse_mask_128 = F.interpolate(
+                                coarse_mask_t.unsqueeze(0).unsqueeze(0),
+                                size=(128, 128),
+                                mode='bilinear',
+                                align_corners=False
+                            )
+                            # Stage2レベルでマスク精緻化
+                            inp2 = torch.cat([coarse_mask_128, stage2_up], dim=1)  # (1, 65, 128, 128)
+                            refine1_mask = self.refine1_net(inp2)  # (1,1,128,128)
+                            # Stage1レベルでさらに精緻化
+                            inp1 = torch.cat([
+                                F.interpolate(refine1_mask, size=(256, 256), mode='bilinear', align_corners=False),
+                                stage1_up
+                            ], dim=1)  # (1, 65, 256,256)
+                            refine2_mask = self.refine2_net(inp1)  # (1,1,256,256)
+                            # 最終マスクを元解像度にアップサンプル 
+                            final_mask = F.interpolate(
+                                refine2_mask,
+                                size=(coarse_mask.shape[-2], coarse_mask.shape[-1]),
+                                mode='bilinear',
+                                align_corners=False
+                            )  # (1,1,H,W)
+                            final_mask = torch.sigmoid(final_mask)  # (1,1,H,W) [0,1]に正規化
+                            refined_masks.append(final_mask.squeeze(0))  # (1,H,W)
+                            # デバッグ: マスク値範囲
+                            fm = final_mask.squeeze(0)
+                            print(f"  提案{m+1}精緻化マスク統計: min={float(fm.min()):.6f}, max={float(fm.max()):.6f}, mean={float(fm.mean()):.6f}")
+                        refined_masks = torch.stack(refined_masks, dim=0)  # (3, H, W)
+                        print(f"  ✅ マルチスケールマスク生成成功: 精緻化マスク{refined_masks.shape}")
+                        predicted_masks.append(refined_masks.to(device))
+                        if iou_preds is not None:
+                            iou_predictions.append(iou_preds.to(device))
+                    else:
+                        # 高解像度特徴抽出無効時は基本マスクを使用
+                        predicted_masks.append(masks.to(device))
+                        if iou_preds is not None:
+                            iou_predictions.append(iou_preds.to(device))
                 except Exception as e:
                     # エラー時はフォールバック: 通常のSAM2マスクを使用
                     print(f"  ❌ マルチスケールマスク生成エラー: {e}")

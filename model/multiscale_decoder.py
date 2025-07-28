@@ -163,12 +163,46 @@ class MultiScaleFeatureExtractor(nn.Module):
         Returns:
             各ステージの特徴マップの辞書
         """
+        # 特徴マップをクリア
+        self.feature_maps.clear()
+        
+        # SAM2のFPN neck出力を直接使用する（より安定的）
+        if hasattr(model, 'neck') and hasattr(model, 'trunk'):
+            print("🔍 SAM2 FPN neck経由の特徴抽出を実行...")
+            with torch.no_grad():
+                # トランクで階層的特徴を抽出
+                trunk_output = model.trunk(x)
+                # FPN neckで特徴を融合
+                features, pos = model.neck(trunk_output)
+                
+                # FPN出力は通常リスト形式（複数レベルの特徴）
+                if isinstance(features, (list, tuple)):
+                    # 最高解像度の特徴を使用（通常は最初の要素）
+                    main_features = features[0] if len(features) > 0 else features
+                    self.feature_maps['fpn_features'] = main_features
+                    self.feature_maps['final'] = main_features
+                    print(f"✅ FPN特徴抽出成功:")
+                    print(f"  - FPN特徴数: {len(features)}")
+                    print(f"  - メイン特徴: {main_features.shape}")
+                else:
+                    self.feature_maps['fpn_features'] = features
+                    self.feature_maps['final'] = features
+                    print(f"✅ FPN特徴抽出成功:")
+                    print(f"  - FPN特徴: {features.shape}")
+                
+                if pos is not None:
+                    self.feature_maps['fpn_pos_encoding'] = pos
+                    if isinstance(pos, (list, tuple)):
+                        print(f"  - 位置エンコーディング数: {len(pos)}")
+                    else:
+                        print(f"  - 位置エンコーディング: {pos.shape}")
+                
+            return self.feature_maps
+        
+        # フォールバック: フックベースの抽出
         # フックが登録されていない場合は登録を試みる
         if not self.hooks:
             self.register_hooks(model)
-        
-        # 特徴マップをクリア
-        self.feature_maps.clear()
         
         # フックが登録されている場合のみマルチスケール特徴抽出
         if self.hooks:
