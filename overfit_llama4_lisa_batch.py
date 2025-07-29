@@ -284,7 +284,7 @@ class LisaOverfitTest:
             from utils.dataset import preprocess_sam_image, build_correct_labels_for_llama4
             
             # テスト画像作成
-            test_image = Image.new('RGB', (336, 336), color='red')
+            test_image = Image.new('RGB', (448, 448), color='red')
             test_prompt = "Please segment the red region in this image."
             
             # 1. SAM用画像処理

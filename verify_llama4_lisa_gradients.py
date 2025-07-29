@@ -49,7 +49,7 @@ def print_header(title: str):
 def create_test_data() -> Tuple[Image.Image, str, str]:
     """Create test image and text data with dataset context"""
     # Simple test image (Lambda Cloud標準サイズ)
-    test_image = Image.new('RGB', (336, 336), color='red')
+    test_image = Image.new('RGB', (448, 448), color='red')
     
     # Test prompt for segmentation (HybridDataset形式に準拠)
     test_prompt = "Please segment the red region in this image."

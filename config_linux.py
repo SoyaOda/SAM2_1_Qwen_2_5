@@ -80,6 +80,7 @@ LOW_CPU_MEM_USAGE = True  # CPU→GPU転送を最適化（メモリ使用量削�
 # Llama-4-Scout-17B-16E-Instruct設定（2025年1月最新バグ回避）
 ATTN_IMPLEMENTATION = "sdpa"  # 最も安定（flex_attentionバグ回避、Issue #37352）
 # 注: flex_attentionは推奨だがTypeErrorバグあり、eagerもcausal maskバグあり（Issue #37322）
+# ⚠️ 重要: この設定は全スクリプトで統一使用すること（個別指定禁止）
 DEVICE_MAP = "auto"                     # GPU自動分散（実使用値）
 TORCH_DTYPE = torch.bfloat16            # Llama-4 Scout推奨精度（BFloat16バックワードパス対応・2025年Web調査修正）
 
@@ -114,10 +115,12 @@ LORA_TARGET_MODULES = [
     "gate_proj", "up_proj", "down_proj"      # FFN層（必須）
 ]
 
-# 🔄 SAM2+MLE論文準拠: モーダル特化target_modules（Web調査ベース修正）
+# 🔄 SAM2+MLE論文準拠: モーダル特化target_modules（実際のモジュール名に修正）
 SAM2_TARGET_MODULES = [
-    "qkv",                                   # SAM2 combined QKV projection（Web調査結果）
-    "proj"                                   # SAM2 output projection（Web調査結果）
+    "attn.qkv",                              # SAM2 combined QKV projection（ログから判明）
+    "attn.proj",                             # SAM2 output projection（ログから判明）
+    "mlp.layers.0",                          # SAM2 MLP第1層（ログから判明）
+    "mlp.layers.1"                           # SAM2 MLP第2層（ログから判明）
 ]
 
 QFORMER_TARGET_MODULES = [

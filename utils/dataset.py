@@ -29,22 +29,32 @@ from .sem_seg_dataset import SemSegDataset
 from .vqa_dataset import VQADataset
 from .transforms import ResizeLongestSide
 
+# 🔧 修正方針M: config重複読み込み防止（キャッシュ機能追加）
+_cached_config = None
+
 def get_config():
-    """実行時の設定ファイルを動的に取得"""
+    """実行時の設定ファイルを動的に取得（キャッシュ機能付き）"""
+    global _cached_config
+    if _cached_config is not None:
+        return _cached_config
+    
     try:
         config_path = os.environ.get('LISA_CONFIG_PATH', 'config_linux')
         if os.path.exists('config_small_test.py'):
             import config_small_test as config
             print("設定: config_small_test.py を使用")
+            _cached_config = config
             return config
         if config_path == 'config_linux' and os.path.exists('config_linux.py'):
             import config_linux as config
             print("設定: config_linux.py を使用")
+            _cached_config = config
             return config
         if config_path != 'config_linux':
             import importlib
             config = importlib.import_module(config_path)
             print(f"設定: {config_path}.py を使用")
+            _cached_config = config
             return config
     except ImportError as e:
         print(f"設定ファイルのインポートに失敗: {e}")
@@ -55,7 +65,8 @@ def get_config():
         SAM_IMAGE_SIZE = 1024
         SEG_TOKEN = "[SEG]"
         DATASET_BASE_DIR = "./dataset"
-    return DefaultConfig()
+    _cached_config = DefaultConfig()
+    return _cached_config
 
 config = get_config()
 
@@ -134,6 +145,42 @@ def preprocess_sam_image(image: Image.Image, target_size: Optional[int] = None) 
     image_tensor = F.pad(image_tensor, (0, padw, 0, padh))
     
     return image_tensor
+
+
+def preprocess_mask_sam2_compliant(mask: np.ndarray, target_size: int = 1024) -> torch.Tensor:
+    """
+    画像前処理と同等のマスク前処理（SAM2+Original-LISA準拠）
+    
+    Args:
+        mask: 入力マスク（numpy配列、2D）
+        target_size: 目標サイズ（通常1024）
+        
+    Returns:
+        前処理済みマスクテンソル (H, W)
+    """
+    # 1. ResizeLongestSideで画像と同じ変換を適用
+    transform = ResizeLongestSide(target_size)
+    resized_mask = transform.apply_image(mask.astype(np.uint8))  # uint8で変換
+    
+    # 2. 二値化処理（補間による値のブレを修正）
+    resized_mask = (resized_mask > 0.5).astype(np.float32)
+    
+    # 3. テンソル化（正規化は不要）
+    mask_tensor = torch.from_numpy(resized_mask).float()
+    if mask_tensor.dim() == 2:
+        mask_tensor = mask_tensor.unsqueeze(0)  # (1, H, W)
+    elif mask_tensor.dim() == 3 and mask_tensor.shape[2] == 1:
+        # (H, W, 1) → (1, H, W)
+        mask_tensor = mask_tensor.squeeze(-1).unsqueeze(0)
+    
+    # 4. パディング（画像と同じ処理）
+    h, w = mask_tensor.shape[-2:]
+    padh = target_size - h
+    padw = target_size - w
+    mask_tensor = F.pad(mask_tensor, (0, padw, 0, padh))
+    
+    return mask_tensor.squeeze(0)  # (H, W)
+
 
 # preprocess_llama_image関数は削除済み
 # Meta公式推奨：AutoProcessorを直接使用してpixel_valuesの最初のパッチを選択
@@ -505,11 +552,11 @@ class HybridDataset(torch.utils.data.Dataset):
             # Meta公式推奨：AutoProcessorのpixel_valuesを標準処理
             if 'pixel_values' in llama_inputs:
                 pixel_values_raw = llama_inputs['pixel_values']
-                # Llama-4のEarly Fusionアーキテクチャ：[10, 3, 336, 336] → 最初のパッチを選択
+                # Llama-4のEarly Fusionアーキテクチャ：[10, 3, 448, 448] → 最初のパッチを選択
                 if pixel_values_raw.dim() == 4 and pixel_values_raw.size(0) == 10:
-                    pixel_values = pixel_values_raw[0]  # [3, 336, 336]
+                    pixel_values = pixel_values_raw[0]  # [3, 448, 448]
                 elif pixel_values_raw.dim() == 3:
-                    pixel_values = pixel_values_raw  # [3, 336, 336]
+                    pixel_values = pixel_values_raw  # [3, 448, 448]
                 else:
                     pixel_values = pixel_values_raw.squeeze(0)
             else:
@@ -555,8 +602,6 @@ class HybridDataset(torch.utils.data.Dataset):
         else:
             ground_truth_mask = None
 
-        print(f"🔥 [HybridDataset-return] 返却するpixel_values形状: {pixel_values.shape}")
-        print(f"🔥 [HybridDataset-return] 返却するsam_pixel_values形状: {image_sam.shape}")
         
         return {
             'input_ids': input_ids,
@@ -609,7 +654,6 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
     for idx, item in enumerate(batch):
         # デュアルエンコーダー構成: 両方の画像を収集
         if "pixel_values" in item:
-            print(f"🔍 [collate_fn] バッチ{idx} pixel_values形状: {item['pixel_values'].shape}")
             pixel_values.append(item["pixel_values"])
         sam_pixel_values.append(item["sam_pixel_values"])
         input_ids.append(item["input_ids"])
@@ -638,15 +682,10 @@ def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
     
     # デュアルエンコーダー構成: 両方の画像をスタック
     if pixel_values:
-        print(f"🔍 [collate_fn] stack前のpixel_values個数: {len(pixel_values)}")
-        print(f"🔍 [collate_fn] 各pixel_valuesの形状: {[pv.shape for pv in pixel_values]}")
         pixel_values = torch.stack(pixel_values)
-        print(f"🔍 [collate_fn] stack後のpixel_values形状: {pixel_values.shape}")
     else:
         # フォールバック：pixel_valuesがない場合はSAM画像から生成
-        print(f"🔍 [collate_fn] pixel_valuesなし、SAM画像から生成")
         pixel_values = torch.stack([F.interpolate(sam.unsqueeze(0), size=(448, 448), mode='bilinear').squeeze(0) for sam in sam_pixel_values])
-        print(f"🔍 [collate_fn] 生成後のpixel_values形状: {pixel_values.shape}")
     sam_pixel_values = torch.stack(sam_pixel_values)
     max_length = max(ids.size(0) for ids in input_ids)
     def pad_sequence(sequences, max_len, pad_value=0):

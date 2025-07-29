@@ -21,8 +21,15 @@ import config_linux
 # Enhanced Model 
 from model.enhanced_llama4_qformer_sam2 import (EnhancedQFormerSegmentationBridge, EnhancedLlamaQFormerSAM2Config)
 
-# Transformers 
-from transformers import AutoModelForCausalLM, AutoProcessor
+# Transformers (2025年正規実装準拠)
+try:
+    from transformers import Llama4ForConditionalGeneration, AutoProcessor
+    LLAMA4_AVAILABLE = True
+    print("✅ Llama4ForConditionalGeneration利用可能")
+except ImportError:
+    from transformers import AutoModelForCausalLM as Llama4ForConditionalGeneration, AutoProcessor
+    LLAMA4_AVAILABLE = False
+    print("⚠️ Llama4ForConditionalGeneration未対応、AutoModelForCausalLM使用")
 
 def calculate_iou(pred_mask, gt_mask, smooth=1e-6):
     """IoU計算"""
@@ -74,9 +81,10 @@ def multiscale_inference(model, image: torch.Tensor, text_input: List[str], scal
         else:
             scaled_image = image
         print(f"  スケール {scale}: {scaled_image.shape[-2:]} -> {original_size}")
-        # 推論実行
+        # 推論実行 (SAM2用画像も必要)
+        scaled_sam_image = scaled_image  # SAM2用は同じ画像を使用
         with torch.no_grad():
-            outputs = model(images=scaled_image, text_input=text_input, mode='itg')
+            outputs = model(images=scaled_image, sam_images=scaled_sam_image, text_input=text_input, mode='itg')
         # マスクを元のサイズに戻す
         masks = outputs['masks']
         if masks.shape[-2:] != original_size:
@@ -112,20 +120,21 @@ def test_enhanced_multiscale_lora():
     print(f"✅ GPU利用可能: {torch.cuda.get_device_name()}")
     print(f"  - GPU数: {torch.cuda.device_count()}")
 
-    # 1. Llama-4初期化
+    # 1. Llama-4初期化 (2025年正規実装準拠)
     print("\n🧠 Llama-4初期化...")
-    llama_model = AutoModelForCausalLM.from_pretrained(
+    llama_model = Llama4ForConditionalGeneration.from_pretrained(
         config_linux.LLAMA_MODEL_ID,
         device_map="auto",
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="flash_attention_2"
+        attn_implementation=config_linux.ATTN_IMPLEMENTATION,  # config統一
+        low_cpu_mem_usage=True
     )
     llama_processor = AutoProcessor.from_pretrained(
         config_linux.LLAMA_MODEL_ID,
         trust_remote_code=True
     )
-    print("✅ Llama-4初期化完了")
+    print("✅ Llama-4初期化完了 (2025年正規実装)")
 
     # 2. Enhanced Model初期化（マルチスケール + LoRA有効）
     print("\n🚀 Enhanced Model初期化（マルチスケール + LoRA有効）...")
@@ -156,19 +165,21 @@ def test_enhanced_multiscale_lora():
     print(f"  - LoRAモジュール数: {lora_count}")
     print(f"  - LoRAパラメータ数: {lora_params:,}")
 
-    # 3. テストデータ準備
+    # 3. テストデータ準備 (デュアルエンコーダー構成対応)
     print("\n📦 テストデータ作成...")
     batch_size = 1
-    test_image = torch.randn(batch_size, 3, 448, 448).cuda()
+    test_image = torch.randn(batch_size, 3, 448, 448, dtype=torch.bfloat16).cuda()      # Llama-4用 (正式仕様サイズ)
+    test_sam_image = torch.randn(batch_size, 3, 1024, 1024, dtype=torch.bfloat16).cuda() # SAM2用
     test_text = ["Segment the main object in this image"]
-    test_labels = torch.zeros(batch_size, 448, 448, dtype=torch.float).cuda()
-    # 円形のテストラベル作成
-    center_y, center_x = 224, 224
-    radius = 80
-    y, x = np.ogrid[:448, :448]
+    test_labels = torch.zeros(batch_size, 1024, 1024, dtype=torch.float).cuda()  # SAM2解像度に合わせる
+    # 円形のテストラベル作成 (SAM2解像度に合わせる)
+    center_y, center_x = 512, 512  # 1024x1024の中心
+    radius = 150  # サイズに比例して拡大
+    y, x = np.ogrid[:1024, :1024]
     mask = (x - center_x) ** 2 + (y - center_y) ** 2 <= radius ** 2
     test_labels[0][mask] = 1.0
-    print(f"  - 画像形状: {test_image.shape}")
+    print(f"  - Llama-4画像形状: {test_image.shape}")
+    print(f"  - SAM2画像形状: {test_sam_image.shape}")
     print(f"  - テキスト: {test_text}")
     print(f"  - ラベル形状: {test_labels.shape}")
     print(f"  - GT正例ピクセル数: {test_labels.sum().item()}")
@@ -178,7 +189,13 @@ def test_enhanced_multiscale_lora():
     try:
         start_time = time.time()
         with torch.no_grad():
-            outputs = model(images=test_image, text_input=test_text, labels=test_labels, mode='itg')
+            outputs = model(
+                images=test_image, 
+                sam_images=test_sam_image,  # SAM2用画像を追加
+                text_input=test_text, 
+                labels=test_labels, 
+                mode='itg'
+            )
         single_scale_time = time.time() - start_time
         print("\n✅ 単一スケールForward成功！")
         print(f"  - マスク形状: {outputs['masks'].shape}")
@@ -194,8 +211,23 @@ def test_enhanced_multiscale_lora():
             print(f"  - クエリ埋め込み: {qf_out['query_embeds'].shape}")
             print(f"  - LLM埋め込み: {qf_out['llm_embeds'].shape}")
             print(f"  - SAMプロンプト: {qf_out['sam_prompts'].shape}")
-        # 単一スケール予測評価
-        single_mask = outputs['masks'][0, 0]
+        # 単一スケール予測評価（Web調査準拠: SAM2最良マスク選択）
+        masks = outputs['masks'][0]  # [3, H, W] - SAM2は3つのマスクを出力
+        iou_scores = outputs.get('iou_scores', None)
+        
+        # SAM2ベストプラクティス: IoUスコアが最も高いマスクを選択
+        if iou_scores is not None and len(iou_scores) > 0:
+            best_mask_idx = torch.argmax(iou_scores[0])
+            single_mask = masks[best_mask_idx]
+            print(f"  🎯 最良マスク選択: Index {best_mask_idx}, IoU Score: {iou_scores[0][best_mask_idx]:.3f}")
+        else:
+            # フォールバック: 最初のマスクを使用
+            single_mask = masks[0]
+            print(f"  ⚠️ IoUスコア無し、最初のマスク使用")
+        
+        # マスクの統計を確認（デバッグ用）
+        print(f"  📊 選択マスク統計: Min={single_mask.min():.6f}, Max={single_mask.max():.6f}, Mean={single_mask.mean():.6f}")
+        
         single_iou = calculate_iou(single_mask > 0.5, test_labels[0])
         single_dice = calculate_dice(single_mask > 0.5, test_labels[0])
         print("\n📊 単一スケール評価:")

@@ -215,33 +215,84 @@ class QFormerMultiModalLoss(nn.Module):
         return losses
     
     def _compute_itc_loss(self, query_embeds: torch.Tensor, text_embeds: torch.Tensor) -> torch.Tensor:
-        """ITC損失計算（対照学習）- Float32混入防止版"""
+        """ITC損失計算（対照学習）- 修正方針Y: Webリサーチに基づく温度パラメータ最適化"""
         # データ型保持
         target_dtype = query_embeds.dtype
         target_device = query_embeds.device
         
+        # デバッグログ追加
+        print(f"🔍 ITC損失計算開始:")
+        print(f"  - query_embeds: {query_embeds.shape}, dtype={query_embeds.dtype}")
+        print(f"  - text_embeds: {text_embeds.shape}, dtype={text_embeds.dtype}")
+        print(f"  - temperature: {self.temperature}")
+        
         # クエリ埋め込みを平均化
-        image_feat = query_embeds.mean(dim=1)  # (B, hidden_size)
-        text_feat = text_embeds  # (B, hidden_size)
+        image_feat = query_embeds.mean(dim=1)  # (B, qformer_hidden_size)
+        text_feat = text_embeds  # (B, llm_hidden_size)
         
-        # 正規化（データ型保持）
-        image_feat = F.normalize(image_feat.float(), dim=-1).to(dtype=target_dtype)
-        text_feat = F.normalize(text_feat.float(), dim=-1).to(dtype=target_dtype)
+        # 🔧 修正方針P継続: 次元不一致対策 - BLIP-2準拠のプロジェクション層
+        if image_feat.size(-1) != text_feat.size(-1):
+            print(f"🔧 次元不一致検出: image_feat={image_feat.shape}, text_feat={text_feat.shape}")
+            
+            # 動的プロジェクション層作成（BLIP-2準拠）
+            if not hasattr(self, '_projection_layer'):
+                self._projection_layer = nn.Linear(
+                    image_feat.size(-1), 
+                    text_feat.size(-1),
+                    bias=False
+                ).to(device=target_device, dtype=target_dtype)
+                print(f"✅ プロジェクション層作成: {image_feat.size(-1)} → {text_feat.size(-1)}")
+            
+            # Q-Former特徴をLLM次元に投影
+            image_feat = self._projection_layer(image_feat)
+            print(f"✅ 次元変換完了: {image_feat.shape}")
         
-        # 類似度行列（データ型保持）
-        sim_matrix = torch.matmul(image_feat, text_feat.t()) / self.temperature
+        # 🔧 修正方針Y: Webリサーチ結果に基づく改善
+        # 1. バッチサイズ1の場合の特別処理（対照学習不可能）
+        batch_size = image_feat.size(0)
+        if batch_size == 1:
+            print(f"⚠️ バッチサイズ1: 対照学習スキップ（最小損失返却）")
+            # バッチサイズ1では対照学習が不可能なため、最小損失を返す
+            return torch.tensor(0.01, device=target_device, dtype=target_dtype)
+        
+        # 2. L2正規化（数値安定性向上）
+        image_feat = F.normalize(image_feat.float(), dim=-1, eps=1e-8).to(dtype=target_dtype)
+        text_feat = F.normalize(text_feat.float(), dim=-1, eps=1e-8).to(dtype=target_dtype)
+        
+        print(f"🔍 正規化後:")
+        print(f"  - image_feat: min={image_feat.min().item():.6f}, max={image_feat.max().item():.6f}")
+        print(f"  - text_feat: min={text_feat.min().item():.6f}, max={text_feat.max().item():.6f}")
+        
+        # 3. 類似度行列計算（温度パラメータ適用）
+        sim_matrix = torch.matmul(image_feat, text_feat.t())
+        print(f"🔍 類似度行列（温度前）: min={sim_matrix.min().item():.6f}, max={sim_matrix.max().item():.6f}")
+        
+        # 4. 温度スケーリング（Webリサーチ: 0.07は一般的だが、小さいバッチには大きすぎる可能性）
+        sim_matrix = sim_matrix / self.temperature
+        print(f"🔍 温度スケーリング後: min={sim_matrix.min().item():.6f}, max={sim_matrix.max().item():.6f}")
+        
         if sim_matrix.dtype != target_dtype:
             sim_matrix = sim_matrix.to(dtype=target_dtype)
         
-        # ラベル (対角線が正例)
-        batch_size = sim_matrix.size(0)
+        # 5. ラベル (対角線が正例)
         labels = torch.arange(batch_size, device=target_device, dtype=torch.long)
         
-        # 双方向損失（データ型保持）
-        loss_i2t = F.cross_entropy(sim_matrix.float(), labels).to(dtype=target_dtype)
-        loss_t2i = F.cross_entropy(sim_matrix.t().float(), labels).to(dtype=target_dtype)
+        # 6. 双方向損失計算（数値安定性向上）
+        # Image-to-Text
+        loss_i2t = F.cross_entropy(sim_matrix.float(), labels, reduction='mean')
+        print(f"🔍 loss_i2t: {loss_i2t.item():.6f}")
         
-        return (loss_i2t + loss_t2i) / 2.0
+        # Text-to-Image  
+        loss_t2i = F.cross_entropy(sim_matrix.t().float(), labels, reduction='mean')
+        print(f"🔍 loss_t2i: {loss_t2i.item():.6f}")
+        
+        # 最終損失
+        final_loss = (loss_i2t + loss_t2i) / 2.0
+        final_loss = final_loss.to(dtype=target_dtype)
+        
+        print(f"🔍 最終ITC損失: {final_loss.item():.6f}")
+        
+        return final_loss
 
 
 class SAM2PromptOptimizationLoss(nn.Module):

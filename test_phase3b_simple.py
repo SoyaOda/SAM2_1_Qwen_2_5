@@ -21,8 +21,15 @@ from model.enhanced_llama4_qformer_sam2 import (
     EnhancedLlamaQFormerSAM2Config
 )
 
-# Transformers
-from transformers import AutoModelForCausalLM, AutoProcessor
+# Transformers (2025年正規実装準拠)
+try:
+    from transformers import Llama4ForConditionalGeneration, AutoProcessor
+    LLAMA4_AVAILABLE = True
+    print("✅ Llama4ForConditionalGeneration利用可能")
+except ImportError:
+    from transformers import AutoModelForCausalLM as Llama4ForConditionalGeneration, AutoProcessor
+    LLAMA4_AVAILABLE = False
+    print("⚠️ Llama4ForConditionalGeneration未対応、AutoModelForCausalLM使用")
 
 
 def test_simple():
@@ -36,14 +43,15 @@ def test_simple():
     print(f"✅ GPU利用可能: {torch.cuda.get_device_name()}")
     print(f"  - GPU数: {torch.cuda.device_count()}")
     
-    # 1. Llama-4初期化
+    # 1. Llama-4初期化 (2025年正規実装準拠)
     print("\n🧠 Llama-4初期化...")
-    llama_model = AutoModelForCausalLM.from_pretrained(
+    llama_model = Llama4ForConditionalGeneration.from_pretrained(
         config_linux.LLAMA_MODEL_ID,
         device_map="auto",
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="flash_attention_2"
+        attn_implementation=config_linux.ATTN_IMPLEMENTATION,  # config統一
+        low_cpu_mem_usage=True
     )
     
     llama_processor = AutoProcessor.from_pretrained(
@@ -51,7 +59,7 @@ def test_simple():
         trust_remote_code=True
     )
     
-    print("✅ Llama-4初期化完了")
+    print("✅ Llama-4初期化完了 (2025年正規実装)")
     
     # 2. Enhanced Model初期化（マルチスケール無効）
     print("\n🚀 Enhanced Model初期化...")
@@ -71,13 +79,15 @@ def test_simple():
     # 3. テスト実行
     print("\n🧪 Forward処理テスト...")
     
-    # テストデータ作成
+    # テストデータ作成 (デュアルエンコーダー構成対応)
     batch_size = 1
-    test_image = torch.randn(batch_size, 3, 448, 448).cuda()
+    test_image = torch.randn(batch_size, 3, 448, 448, dtype=torch.bfloat16).cuda()      # Llama-4用 (正式仕様サイズ)
+    test_sam_image = torch.randn(batch_size, 3, 1024, 1024, dtype=torch.bfloat16).cuda() # SAM2用
     test_text = ["This is a test image with objects"]
-    test_labels = torch.zeros(batch_size, 448, 448, dtype=torch.long).cuda()
+    test_labels = torch.zeros(batch_size, 1024, 1024, dtype=torch.long).cuda()  # SAM2解像度に合わせる
     
-    print(f"  - 画像形状: {test_image.shape}")
+    print(f"  - Llama-4画像形状: {test_image.shape}")
+    print(f"  - SAM2画像形状: {test_sam_image.shape}")
     print(f"  - テキスト: {test_text}")
     print(f"  - ラベル形状: {test_labels.shape}")
     
@@ -86,6 +96,7 @@ def test_simple():
         with torch.no_grad():
             outputs = model(
                 images=test_image,
+                sam_images=test_sam_image,  # SAM2用画像を追加
                 text_input=test_text,
                 labels=test_labels,
                 mode='itg'

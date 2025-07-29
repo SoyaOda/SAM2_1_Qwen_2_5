@@ -175,6 +175,13 @@ class SAM2Wrapper(nn.Module):
         else:
             self._target_dtype = target_dtype
         
+        # 🔧 SAM2公式推奨: Ampere GPU最適化（TensorFloat-32有効化）
+        if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            if debug_mode:
+                print("  ✅ TensorFloat-32有効化 (Ampere GPU最適化)")
+        
         if debug_mode:
             print(f"  🔧 SAM2Wrapper設定:")
             print(f"    - target_dtype: {target_dtype}")
@@ -343,8 +350,9 @@ class SAM2Wrapper(nn.Module):
         else:
             image_np = image
             
-        # 🔄 Meta公式SAM2 API
-        self.predictor.set_image(image_np)
+        # 🔄 Meta公式SAM2 API (BFloat16対応)
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            self.predictor.set_image(image_np)
     
     def predict_with_prompts(
         self,
@@ -392,12 +400,14 @@ class SAM2Wrapper(nn.Module):
                 box_tensor = boxes[0].to(torch.float32) if boxes[0].dtype == torch.bfloat16 else boxes[0]
                 box_np = box_tensor.detach().cpu().numpy()
             
-            masks, iou_predictions, low_res_logits = self.predictor.predict(
-                point_coords=point_coords_np,
-                point_labels=point_labels_np,
-                box=box_np,
-                multimask_output=multimask_output
-            )
+            # SAM2公式推奨: BFloat16 autocast使用
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                masks, iou_predictions, low_res_logits = self.predictor.predict(
+                    point_coords=point_coords_np,
+                    point_labels=point_labels_np,
+                    box=box_np,
+                    multimask_output=multimask_output
+                )
         else:
             # Q-Formerプロンプトから推定座標生成（簡易版）
             # 将来: prompt_embeddingsを座標に変換するネットワーク追加
@@ -419,12 +429,13 @@ class SAM2Wrapper(nn.Module):
             point_coords_np = torch.tensor(points, dtype=torch.float32).numpy()
             point_labels_np = torch.tensor(labels, dtype=torch.int32).numpy()
             
-            # 🔄 Meta公式SAM2 API
-            masks, iou_predictions, low_res_logits = self.predictor.predict(
-                point_coords=point_coords_np,
-                point_labels=point_labels_np,
-                multimask_output=multimask_output
-            )
+            # 🔄 Meta公式SAM2 API (BFloat16対応)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                masks, iou_predictions, low_res_logits = self.predictor.predict(
+                    point_coords=point_coords_np,
+                    point_labels=point_labels_np,
+                    multimask_output=multimask_output
+                )
         
         # numpy配列をPyTorchテンソルに変換（GPU専用環境 + 2025年ベストプラクティス Web調査準拠）
         device = getattr(self, '_target_device', 'cuda')

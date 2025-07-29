@@ -586,7 +586,7 @@ class Phase3BRealIntegrationTest:
         
         try:
             # テスト画像作成
-            test_image = Image.new('RGB', (336, 336), color='red')
+            test_image = Image.new('RGB', (448, 448), color='red')
             # Web調査準拠：<|image|>プレースホルダー付きプロンプト
             test_prompt_with_placeholder = "<|image|>Please segment the red region in this image."
             
