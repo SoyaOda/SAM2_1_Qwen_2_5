@@ -1706,7 +1706,22 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
                 print(f"  - 変換前勾配状況: requires_grad={masks.requires_grad}, grad_fn={masks.grad_fn}")
                 
                 # Web調査修正: AuxiliaryDecoderを活用した学習可能アップサンプリング
-                if hasattr(self.segmentation_head, 'aux_decoder'):
+                # 正しい属性パス: segmentation_head.enhanced_decoder.aux_decoder
+                # AuxiliaryDecoder二重ガード（安全性強化）
+                aux_decoder_available = False
+                try:
+                    if (hasattr(self.segmentation_head, 'enhanced_decoder') and 
+                        self.segmentation_head.enhanced_decoder is not None and
+                        hasattr(self.segmentation_head.enhanced_decoder, 'aux_decoder') and
+                        self.segmentation_head.enhanced_decoder.aux_decoder is not None and
+                        hasattr(self.segmentation_head.enhanced_decoder.aux_decoder, 'upsampling_layers') and
+                        self.segmentation_head.enhanced_decoder.aux_decoder.upsampling_layers is not None):
+                        aux_decoder_available = True
+                except (AttributeError, RuntimeError) as guard_error:
+                    print(f"  🔍 AuxiliaryDecoder二重ガード検出: {guard_error}")
+                    aux_decoder_available = False
+                
+                if aux_decoder_available:
                     print(f"  🎯 AuxiliaryDecoder使用: 学習可能アップサンプリング")
                     
                     # SAM2マスクロジットをAuxiliaryDecoderで高解像度化
@@ -1718,7 +1733,7 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
                     try:
                         # Web調査準拠: DeepLabV3スタイルの補助出力による学習可能アップサンプリング
                         # 転置畳み込みによる学習可能アップサンプリング (256x256 -> 1024x1024)
-                        masks_upsampled = self.segmentation_head.aux_decoder.upsampling_layers(masks_reshaped)
+                        masks_upsampled = self.segmentation_head.enhanced_decoder.aux_decoder.upsampling_layers(masks_reshaped)
                         
                         # 元の形状に復元: (B*3, 1, 1024, 1024) -> (B, 3, 1024, 1024)
                         masks = masks_upsampled.view(batch_size, num_masks, 1024, 1024)
@@ -1745,6 +1760,23 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
                         masks = masks_upsampled.view(batch_size, num_masks, 1024, 1024)
                         masks = masks.to(dtype=original_dtype)  # 勾配保持型復元
                 else:
+                    # デバッグ: AuxiliaryDecoder検出失敗の詳細分析
+                    print(f"  🔍 AuxiliaryDecoder検出詳細:")
+                    print(f"    - segmentation_head type: {type(self.segmentation_head)}")
+                    print(f"    - has enhanced_decoder: {hasattr(self.segmentation_head, 'enhanced_decoder')}")
+                    
+                    if hasattr(self.segmentation_head, 'enhanced_decoder'):
+                        enhanced_decoder = self.segmentation_head.enhanced_decoder
+                        print(f"    - enhanced_decoder type: {type(enhanced_decoder)}")
+                        print(f"    - has aux_decoder: {hasattr(enhanced_decoder, 'aux_decoder')}")
+                        
+                        if hasattr(enhanced_decoder, 'aux_decoder'):
+                            aux_decoder = enhanced_decoder.aux_decoder
+                            print(f"    - aux_decoder type: {type(aux_decoder)}")
+                            print(f"    - has upsampling_layers: {hasattr(aux_decoder, 'upsampling_layers')}")
+                            if hasattr(aux_decoder, 'upsampling_layers'):
+                                print(f"    - upsampling_layers type: {type(aux_decoder.upsampling_layers)}")
+                    
                     print(f"  ⚠️ AuxiliaryDecoder未検出")
                     print(f"  🔄 改良F.interpolate使用")
                     

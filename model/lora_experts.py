@@ -382,11 +382,23 @@ class LoRAExpertMoE(nn.Module):
         if next(self.router.parameters()).device != input_device:
             self.router = self.router.to(input_device)
         
+        # EPSガード設定（ゼロ除算防止）
+        EPS = 1e-6
+        
         # ルーティング重みの計算
         routing_weights = self.router(x, modality_hint)  # [B, num_experts]
         
+        # routing_probs下限クリップ（ゼロルーティング防止）
+        routing_weights = torch.clamp(routing_weights, min=EPS)
+        
+        # デバッグフラグ設定（使用前に定義）
+        global _LORA_DEBUG_LOGGED
+        should_debug = not _LORA_DEBUG_LOGGED
+        
         # 各エキスパートの出力を計算（デバイス統一付き）
         expert_outputs = []
+        expert_stats = [] if should_debug else None  # デバッグ用統計情報
+        
         for i, expert in enumerate(self.experts):
             # エキスパートのLoRAパラメータをデバイス統一
             if expert.lora_A.device != input_device:
@@ -396,15 +408,21 @@ class LoRAExpertMoE(nn.Module):
             
             expert_output = expert(x)  # LoRA補正のみ
             expert_outputs.append(expert_output)
+            
+            # デバッグ用: 異常検出に必要な統計のみ収集
+            if should_debug and expert_stats is not None:
+                output_norm = expert_output.norm().item()
+                expert_stats.append({
+                    'expert_id': i,
+                    'output_norm': output_norm
+                })
         
         # エキスパート出力をスタック: [num_experts, *expert_output.shape]
         expert_outputs = torch.stack(expert_outputs, dim=0)  # [num_experts, ...]
         
-        # 初回のみデバッグログ出力
-        global _LORA_DEBUG_LOGGED
-        if not _LORA_DEBUG_LOGGED:
-            print(f"  🔍 LoRAExpertMoE形状サマリー: 入力={x.shape}")
-            _LORA_DEBUG_LOGGED = True
+        # 初回のみ基本情報出力
+        if should_debug:
+            print(f"  🔍 LoRAExpertMoE: 入力={x.shape}, experts={self.num_experts}")
         
         # routing_weights形状正規化（Vision MoE標準準拠）
         if routing_weights.dim() == 4:
@@ -424,6 +442,35 @@ class LoRAExpertMoE(nn.Module):
         weight_sums = routing_weights.sum(dim=-1)
         if not torch.allclose(weight_sums, torch.ones_like(weight_sums), atol=1e-5):
             routing_weights = routing_weights / weight_sums.unsqueeze(-1)
+        
+        # 初回のみ基本情報をログ出力
+        if should_debug:
+            print(f"  🔍 MoE統計: routing_weights={routing_weights.shape}, expert_outputs={expert_outputs.shape}")
+            
+            # 異常検出のみ実行（簡略化）
+            if expert_stats:
+                norms = [stat['output_norm'] for stat in expert_stats]
+                
+                # EPSガード付きnorm比較（ゼロ除算防止）
+                min_norm = min(norms)
+                max_norm = max(norms)
+                min_norm_safe = min_norm if min_norm > EPS else EPS
+                norm_ratio = max_norm / min_norm_safe
+                
+                if norm_ratio > 10.0:
+                    print(f"    ⚠️ エキスパート出力不均衡: norm比={norm_ratio:.2f} (min_norm={min_norm:.8f})")
+                elif max_norm < 1e-6:
+                    print(f"    ⚠️ エキスパート出力異常: max_norm={max_norm:.8f}")
+                
+                # MoE偏り可視化デバッグログ
+                if should_debug:
+                    routing_mean = routing_weights.mean(dim=0)
+                    routing_std = routing_weights.std(dim=0)
+                    print(f"    🔍 MoE偏り統計: 平均={routing_mean.tolist()}")
+                    print(f"    🔍 MoE偏り統計: 標準偏差={routing_std.tolist()}")
+            
+            # デバッグフラグ更新
+            _LORA_DEBUG_LOGGED = True
         
         # Vision MoE論文準拠: 空間次元を考慮したToken-level MoE結合
         # expert_outputs形状確認と適切な処理
