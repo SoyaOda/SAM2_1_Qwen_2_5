@@ -169,33 +169,59 @@ class MultiScaleFeatureExtractor(nn.Module):
         # SAM2のFPN neck出力を直接使用する（より安定的）
         if hasattr(model, 'neck') and hasattr(model, 'trunk'):
             print("🔍 SAM2 FPN neck経由の特徴抽出を実行...")
-            with torch.no_grad():
+            # Web調査準拠: 学習時は勾配フロー維持、推論時のみno_grad使用
+            if self.training:
+                print("🔧 学習モード: 勾配フロー維持でSAM2 FPN処理")
                 # トランクで階層的特徴を抽出
                 trunk_output = model.trunk(x)
                 # FPN neckで特徴を融合
                 features, pos = model.neck(trunk_output)
-                
-                # FPN出力は通常リスト形式（複数レベルの特徴）
-                if isinstance(features, (list, tuple)):
-                    # 最高解像度の特徴を使用（通常は最初の要素）
-                    main_features = features[0] if len(features) > 0 else features
-                    self.feature_maps['fpn_features'] = main_features
-                    self.feature_maps['final'] = main_features
-                    print(f"✅ FPN特徴抽出成功:")
-                    print(f"  - FPN特徴数: {len(features)}")
-                    print(f"  - メイン特徴: {main_features.shape}")
+            else:
+                with torch.no_grad():
+                    # トランクで階層的特徴を抽出
+                    trunk_output = model.trunk(x)
+                    # FPN neckで特徴を融合
+                    features, pos = model.neck(trunk_output)
+            
+            # md_files指針準拠: feat_high、feat_mid、feat_globalの3段階構造
+            # FPN出力は通常リスト形式（複数レベルの特徴）
+            if isinstance(features, (list, tuple)):
+                # 指針準拠: マルチスケール特徴マッピング
+                num_features = len(features)
+                if num_features >= 3:
+                    # 3段階以上の場合: 高→中→低解像度
+                    self.feature_maps['stage1'] = features[0]      # feat_high (高解像度)
+                    self.feature_maps['stage2'] = features[1]      # feat_mid (中解像度)  
+                    self.feature_maps['final'] = features[-1]     # feat_global (低解像度)
+                elif num_features == 2:
+                    # 2段階の場合: 高→低解像度
+                    self.feature_maps['stage1'] = features[0]     # feat_high
+                    self.feature_maps['stage2'] = features[0]     # feat_mid (同じ特徴を使用)
+                    self.feature_maps['final'] = features[1]      # feat_global
                 else:
-                    self.feature_maps['fpn_features'] = features
-                    self.feature_maps['final'] = features
-                    print(f"✅ FPN特徴抽出成功:")
-                    print(f"  - FPN特徴: {features.shape}")
+                    # 1段階の場合: 全て同じ特徴
+                    main_feature = features[0] if num_features > 0 else features
+                    self.feature_maps['stage1'] = main_feature    # feat_high
+                    self.feature_maps['stage2'] = main_feature    # feat_mid
+                    self.feature_maps['final'] = main_feature     # feat_global
                 
-                if pos is not None:
-                    self.feature_maps['fpn_pos_encoding'] = pos
-                    if isinstance(pos, (list, tuple)):
-                        print(f"  - 位置エンコーディング数: {len(pos)}")
-                    else:
-                        print(f"  - 位置エンコーディング: {pos.shape}")
+                print(f"✅ FPN特徴抽出成功:")
+                print(f"  - FPN特徴数: {num_features}")
+                print(f"  - メイン特徴: {self.feature_maps['final'].shape}")
+            else:
+                # 単一特徴の場合: 全段階に同じ特徴を割り当て
+                self.feature_maps['stage1'] = features        # feat_high
+                self.feature_maps['stage2'] = features        # feat_mid
+                self.feature_maps['final'] = features         # feat_global
+                print(f"✅ FPN特徴抽出成功:")
+                print(f"  - FPN特徴: {features.shape}")
+            
+            if pos is not None:
+                self.feature_maps['fpn_pos_encoding'] = pos
+                if isinstance(pos, (list, tuple)):
+                    print(f"  - 位置エンコーディング数: {len(pos)}")
+                else:
+                    print(f"  - 位置エンコーディング: {pos.shape}")
                 
             return self.feature_maps
         
@@ -206,9 +232,14 @@ class MultiScaleFeatureExtractor(nn.Module):
         
         # フックが登録されている場合のみマルチスケール特徴抽出
         if self.hooks:
-            # モデルを実行（フックが特徴を収集）
-            with torch.no_grad():
+            # Web調査準拠: 学習時は勾配フロー維持
+            if self.training:
+                print("🔧 学習モード: フックベース特徴抽出で勾配フロー維持")
                 output = model(x)
+            else:
+                # モデルを実行（フックが特徴を収集）
+                with torch.no_grad():
+                    output = model(x)
             
             # SAM2の場合、出力が辞書形式
             if isinstance(output, dict) and 'vision_features' in output:
@@ -253,8 +284,13 @@ class MultiScaleFeatureExtractor(nn.Module):
         else:
             # フックが登録できない場合は通常の出力のみ
             print("⚠️ マルチスケール特徴抽出が利用できません - 最終出力のみ使用")
-            with torch.no_grad():
+            # Web調査準拠: 学習時は勾配フロー維持
+            if self.training:
+                print("🔧 学習モード: 通常出力処理で勾配フロー維持")
                 output = model(x)
+            else:
+                with torch.no_grad():
+                    output = model(x)
             
             # SAM2の場合、出力が辞書形式
             if isinstance(output, dict) and 'vision_features' in output:

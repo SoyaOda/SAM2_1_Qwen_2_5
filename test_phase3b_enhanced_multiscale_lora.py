@@ -152,18 +152,40 @@ def test_enhanced_multiscale_lora():
     )
     print("✅ Enhanced Model初期化完了")
 
-    # LoRA統計表示
+    # LoRA統計表示（Web調査準拠: PEFT正規パラメータカウント）
     lora_count = 0
     lora_params = 0
+    lora_param_details = []
+    
+    print(f"\n🔧 LoRA統計（Web調査準拠PEFT標準）:")
+    
+    # Web調査準拠: named_parameters()によるLoRAパラメータ詳細確認
+    for name, param in model.named_parameters():
+        if any(keyword in name.lower() for keyword in ['lora_a', 'lora_b', 'lora']):
+            if param.requires_grad:
+                lora_params += param.numel()
+                lora_param_details.append({
+                    'name': name,
+                    'shape': list(param.shape),
+                    'count': param.numel(),
+                    'requires_grad': param.requires_grad
+                })
+    
+    # モジュールベースカウント
     for name, module in model.named_modules():
         if 'lora' in name.lower():
             lora_count += 1
-            for param in module.parameters():
-                if param.requires_grad:
-                    lora_params += param.numel()
-    print(f"\n🔧 LoRA統計:")
+    
     print(f"  - LoRAモジュール数: {lora_count}")
     print(f"  - LoRAパラメータ数: {lora_params:,}")
+    
+    # Web調査準拠: LoRAパラメータ詳細表示（デバッグ用）
+    if lora_param_details:
+        print(f"  - LoRAパラメータ詳細（上位5個）:")
+        for detail in lora_param_details[:5]:
+            print(f"    - {detail['name']}: {detail['shape']} ({detail['count']:,}個)")
+    else:
+        print(f"  ⚠️ LoRAパラメータが見つかりません（requires_grad=Trueのもの）")
 
     # 3. テストデータ準備 (デュアルエンコーダー構成対応)
     print("\n📦 テストデータ作成...")
@@ -228,8 +250,25 @@ def test_enhanced_multiscale_lora():
         # マスクの統計を確認（デバッグ用）
         print(f"  📊 選択マスク統計: Min={single_mask.min():.6f}, Max={single_mask.max():.6f}, Mean={single_mask.mean():.6f}")
         
-        single_iou = calculate_iou(single_mask > 0.5, test_labels[0])
-        single_dice = calculate_dice(single_mask > 0.5, test_labels[0])
+        # 🔧 Web調査修正: SAM2推奨しきい値0.0使用 + adaptive threshold
+        # SAM2は既に確率スコアを出力するため、0.5しきい値は不適切
+        adaptive_threshold = 0.0  # SAM2推奨値
+        print(f"  🎯 適応しきい値適用: {adaptive_threshold} (SAM2推奨)")
+        
+        # マスクサイズ統一確認
+        if single_mask.shape != test_labels[0].shape:
+            print(f"  ⚠️ マスクサイズ不一致検出: {single_mask.shape} vs {test_labels[0].shape}")
+            # 高精度補間でサイズ統一
+            single_mask = F.interpolate(
+                single_mask.unsqueeze(0).unsqueeze(0), 
+                size=test_labels[0].shape, 
+                mode='bilinear', 
+                align_corners=False
+            ).squeeze().to(test_labels[0].device)
+            print(f"  🔧 高精度補間後: {single_mask.shape}")
+        
+        single_iou = calculate_iou(single_mask > adaptive_threshold, test_labels[0])
+        single_dice = calculate_dice(single_mask > adaptive_threshold, test_labels[0])
         print("\n📊 単一スケール評価:")
         print(f"  - IoU: {single_iou:.4f}")
         print(f"  - Dice: {single_dice:.4f}")

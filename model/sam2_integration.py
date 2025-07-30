@@ -350,8 +350,9 @@ class SAM2Wrapper(nn.Module):
         else:
             image_np = image
             
-        # 🔄 Meta公式SAM2 API (BFloat16対応)
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        # 🔄 Meta公式SAM2 API (BFloat16対応) - Web調査修正: inference_mode除去
+        # Web調査結果: inference_mode()は勾配フローを完全に切断するため学習時は使用不可
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             self.predictor.set_image(image_np)
     
     def predict_with_prompts(

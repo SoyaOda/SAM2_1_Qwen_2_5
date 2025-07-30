@@ -115,12 +115,23 @@ LORA_TARGET_MODULES = [
     "gate_proj", "up_proj", "down_proj"      # FFN層（必須）
 ]
 
-# 🔄 SAM2+MLE論文準拠: モーダル特化target_modules（実際のモジュール名に修正）
+# 🔄 SAM2+MLE論文準拠: モーダル特化target_modules（ログから判明した実際構造）
 SAM2_TARGET_MODULES = [
-    "attn.qkv",                              # SAM2 combined QKV projection（ログから判明）
-    "attn.proj",                             # SAM2 output projection（ログから判明）
-    "mlp.layers.0",                          # SAM2 MLP第1層（ログから判明）
-    "mlp.layers.1"                           # SAM2 MLP第2層（ログから判明）
+    # ログ判明: SAM2実際のモジュール構造 trunk.blocks.*.* 
+    "trunk.blocks.*.attn.qkv",               # SAM2実際構造（ログ確認済み）
+    "trunk.blocks.*.attn.proj",              # SAM2実際構造（ログ確認済み）
+    "trunk.blocks.*.mlp.layers.0",           # SAM2実際構造（ログ確認済み）
+    "trunk.blocks.*.mlp.layers.1",           # SAM2実際構造（ログ確認済み）
+    # フォールバック: 修正前パターン（互換性維持）
+    "blocks.*.attn.qkv",                     # 従来パターン
+    "blocks.*.attn.proj",                    # 従来パターン
+    "blocks.*.mlp.layers.0",                 # 従来パターン
+    "blocks.*.mlp.layers.1",                 # 従来パターン
+    # 簡略パターンマッチング用（最終フォールバック）
+    "attn.qkv",                              # 階層なしマッチング
+    "attn.proj",                             # 階層なしマッチング
+    "mlp.layers.0",                          # 階層なしマッチング
+    "mlp.layers.1"                           # 階層なしマッチング
 ]
 
 QFORMER_TARGET_MODULES = [

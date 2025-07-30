@@ -15,6 +15,10 @@ from typing import Optional, Dict, List, Tuple, Any, Union
 import math
 from collections import OrderedDict
 
+# グローバルフラグ（冗長ログ防止用）
+_LORA_DEBUG_LOGGED = False
+_ROUTING_WARNING_LOGGED = False
+
 
 class LoRALayer(nn.Module):
     """
@@ -28,8 +32,8 @@ class LoRALayer(nn.Module):
         in_features: int,
         out_features: int,
         rank: int = 16,
-        alpha: float = 16.0,
-        dropout: float = 0.0,
+        alpha: float = 32.0,  # config_linux.LORA_ALPHA統一
+        dropout: float = 0.1,  # config_linux.LORA_DROPOUT統一
         merge_weights: bool = False
     ):
         super().__init__()
@@ -112,8 +116,8 @@ class LoRALinear(nn.Linear):
         in_features: int,
         out_features: int,
         rank: int = 16,
-        alpha: float = 16.0,
-        dropout: float = 0.0,
+        alpha: float = 32.0,  # config_linux.LORA_ALPHA統一
+        dropout: float = 0.1,  # config_linux.LORA_DROPOUT統一
         fan_in_fan_out: bool = False,
         merge_weights: bool = False,
         **kwargs
@@ -297,8 +301,8 @@ class LoRAExpertMoE(nn.Module):
         base_layer: nn.Module,
         num_experts: int = 4,
         rank: int = 16,
-        alpha: float = 16.0,
-        dropout: float = 0.0,
+        alpha: float = 32.0,  # config_linux.LORA_ALPHA統一
+        dropout: float = 0.1,  # config_linux.LORA_DROPOUT統一
         router_config: Optional[Dict[str, Any]] = None
     ):
         super().__init__()
@@ -397,14 +401,11 @@ class LoRAExpertMoE(nn.Module):
         # エキスパート出力をスタック: [num_experts, *expert_output.shape]
         expert_outputs = torch.stack(expert_outputs, dim=0)  # [num_experts, ...]
         
-        # デバッグ: 形状確認（初回のみ）
-        if not hasattr(self, '_debug_printed'):
-            print(f"  🔍 LoRAExpertMoE形状デバッグ:")
-            print(f"    - x.shape: {x.shape}")
-            print(f"    - base_output.shape: {base_output.shape}")
-            print(f"    - expert_outputs.shape: {expert_outputs.shape}")
-            print(f"    - routing_weights.shape: {routing_weights.shape}")
-            self._debug_printed = True
+        # デバッグ: 形状確認（全体で1回のみ、グローバルフラグ使用）
+        global _LORA_DEBUG_LOGGED
+        if not _LORA_DEBUG_LOGGED:
+            print(f"  🔍 LoRAExpertMoE形状サマリー: 入力={x.shape}, 出力={expert_outputs.shape}, 重み={routing_weights.shape}")
+            _LORA_DEBUG_LOGGED = True
         
         # routing_weightsの形状確認
         # routing_weights: [B, num_experts] or [1, num_experts]
@@ -419,8 +420,11 @@ class LoRAExpertMoE(nn.Module):
             # 重み付き和: [B, num_experts, out_features] * [B, num_experts, 1] -> [B, out_features]
             combined_lora = (expert_outputs_permuted * weights).sum(dim=1)  # [B, out_features]
         else:
-            # フォールバック（想定外の形状）
-            print(f"  ⚠️ 想定外のrouting_weights形状: {routing_weights.shape}")
+            # フォールバック（想定外の形状、グローバルフラグで1回のみ警告）
+            global _ROUTING_WARNING_LOGGED
+            if not _ROUTING_WARNING_LOGGED:
+                print(f"  ⚠️ 想定外routing_weights形状検出: {routing_weights.shape} (後続の同様警告は省略)")
+                _ROUTING_WARNING_LOGGED = True
             # エキスパートの平均を使用
             combined_lora = expert_outputs.mean(dim=0)
         
@@ -438,8 +442,8 @@ def inject_lora_to_model(
     model: nn.Module,
     target_modules: List[str],
     rank: int = 16,
-    alpha: float = 16.0,
-    dropout: float = 0.0,
+    alpha: float = 32.0,  # config_linux.LORA_ALPHA統一
+    dropout: float = 0.1,  # config_linux.LORA_DROPOUT統一
     use_moe: bool = False,
     num_experts: int = 4,
     router_config: Optional[Dict[str, Any]] = None
@@ -503,10 +507,15 @@ def inject_lora_to_model(
     
     # LoRAの注入（メモリ安全処理付き）
     injection_count = 0
+    total_modules = len(modules_to_replace)
+    print(f"  🔧 LoRA注入開始: {total_modules}個のモジュール")
+    
     for i, (name, module) in enumerate(modules_to_replace):
-        # ミュート: 詳細注入ログ（5個ごとに要約）
-        if i % 5 == 0 or i == len(modules_to_replace) - 1:
-            print(f"  🔧 LoRA注入進行中: {i+1}/{len(modules_to_replace)}")
+        # 簡略進行表示: 開始、25%、50%、75%、完了のみ
+        progress_points = [0, total_modules//4, total_modules//2, total_modules*3//4, total_modules-1]
+        if i in progress_points:
+            percentage = int((i+1) / total_modules * 100)
+            print(f"  🔧 LoRA注入進行: {percentage}% ({i+1}/{total_modules})")
         
         try:
             # GPU メモリ状況を定期チェック
@@ -576,4 +585,19 @@ def inject_lora_to_model(
         print(f"  - GPU メモリ (注入後): Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
     
     print(f"✅ LoRA注入完了: {injection_count}/{len(modules_to_replace)}個のモジュール")
+    
+    # Web調査準拠: LoRAパラメータのrequires_grad強制有効化
+    lora_param_count = 0
+    lora_param_fixed = 0
+    
+    for name, param in model.named_parameters():
+        if any(keyword in name.lower() for keyword in ['lora_a', 'lora_b', 'lora']):
+            lora_param_count += 1
+            if not param.requires_grad:
+                param.requires_grad = True
+                lora_param_fixed += 1
+    
+    if lora_param_fixed > 0:
+        print(f"🔧 Web調査修正: LoRAパラメータrequires_grad修正 ({lora_param_fixed}/{lora_param_count}個)")
+    
     return model
