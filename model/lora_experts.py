@@ -15,9 +15,8 @@ from typing import Optional, Dict, List, Tuple, Any, Union
 import math
 from collections import OrderedDict
 
-# グローバルフラグ（冗長ログ防止用）
+# グローバルフラグ（初回ログ制御用）
 _LORA_DEBUG_LOGGED = False
-_ROUTING_WARNING_LOGGED = False
 
 
 class LoRALayer(nn.Module):
@@ -401,32 +400,78 @@ class LoRAExpertMoE(nn.Module):
         # エキスパート出力をスタック: [num_experts, *expert_output.shape]
         expert_outputs = torch.stack(expert_outputs, dim=0)  # [num_experts, ...]
         
-        # デバッグ: 形状確認（全体で1回のみ、グローバルフラグ使用）
+        # 初回のみデバッグログ出力
         global _LORA_DEBUG_LOGGED
         if not _LORA_DEBUG_LOGGED:
-            print(f"  🔍 LoRAExpertMoE形状サマリー: 入力={x.shape}, 出力={expert_outputs.shape}, 重み={routing_weights.shape}")
+            print(f"  🔍 LoRAExpertMoE形状サマリー: 入力={x.shape}")
             _LORA_DEBUG_LOGGED = True
         
-        # routing_weightsの形状確認
-        # routing_weights: [B, num_experts] or [1, num_experts]
-        # expert_outputs: [num_experts, B, out_features]
+        # routing_weights形状正規化（Vision MoE標準準拠）
+        if routing_weights.dim() == 4:
+            # 4次元テンソル [N, H, W, K] -> 2次元 [N*H*W, K] に正規化
+            original_shape = routing_weights.shape
+            batch_tokens = original_shape[0] * original_shape[1] * original_shape[2]
+            num_experts = original_shape[3]
+            routing_weights = routing_weights.view(batch_tokens, num_experts)
+        elif routing_weights.dim() == 3:
+            # 3次元テンソル [B, N, K] -> 2次元 [B*N, K] に正規化  
+            routing_weights = routing_weights.view(-1, routing_weights.size(-1))
+        elif routing_weights.dim() != 2:
+            # エラー: フォールバック処理を削除（デバッグ修正ルール準拠）
+            raise RuntimeError(f"MoE routing_weights形状エラー: {routing_weights.shape}。Vision MoE標準の2次元テンソル [tokens, num_experts] が必要です。")
         
-        # 重み付き結合を正しく実装
-        if routing_weights.dim() == 2:
-            # routing_weights: [B, num_experts] -> [B, num_experts, 1]
-            weights = routing_weights.unsqueeze(-1)  # [B, num_experts, 1]
-            # expert_outputs: [num_experts, B, out_features] -> [B, num_experts, out_features]
-            expert_outputs_permuted = expert_outputs.permute(1, 0, 2)  # [B, num_experts, out_features]
-            # 重み付き和: [B, num_experts, out_features] * [B, num_experts, 1] -> [B, out_features]
-            combined_lora = (expert_outputs_permuted * weights).sum(dim=1)  # [B, out_features]
+        # MoE重み正規化確認と調整
+        weight_sums = routing_weights.sum(dim=-1)
+        if not torch.allclose(weight_sums, torch.ones_like(weight_sums), atol=1e-5):
+            routing_weights = routing_weights / weight_sums.unsqueeze(-1)
+        
+        # Vision MoE論文準拠: 空間次元を考慮したToken-level MoE結合
+        # expert_outputs形状確認と適切な処理
+        expert_shape = expert_outputs.shape
+        if len(expert_shape) == 5:
+            # Vision MoE標準: 5次元テンソル [num_experts, batch*tokens, H, W, channels]
+            num_experts, batch_tokens, h, w, channels = expert_shape
+            
+            # 空間次元を統合してtoken-levelで処理
+            expert_outputs_flattened = expert_outputs.view(num_experts, batch_tokens * h * w, channels)
+            
+            # routing_weightsサイズ調整
+            expected_tokens = batch_tokens * h * w
+            if routing_weights.size(0) != expected_tokens:
+                if routing_weights.size(0) > expected_tokens:
+                    routing_weights = routing_weights[:expected_tokens]
+                else:
+                    padding_size = expected_tokens - routing_weights.size(0)
+                    last_weights = routing_weights[-1:].repeat(padding_size, 1)
+                    routing_weights = torch.cat([routing_weights, last_weights], dim=0)
+            
+            # Token-level MoE結合
+            weights = routing_weights.unsqueeze(-1)
+            expert_outputs_permuted = expert_outputs_flattened.permute(1, 0, 2)
+            combined_tokens = (expert_outputs_permuted * weights).sum(dim=1)
+            
+            # 空間構造を復元
+            combined_lora = combined_tokens.view(batch_tokens, h, w, channels)
+            
+        elif len(expert_shape) == 3:
+            # 標準的MoE: 3次元テンソル [num_experts, batch, channels]
+            num_experts, batch_size, channels = expert_shape
+            
+            # routing_weightsサイズ調整
+            if routing_weights.size(0) != batch_size:
+                if routing_weights.size(0) > batch_size:
+                    routing_weights = routing_weights[:batch_size]
+                else:
+                    repeat_factor = batch_size // routing_weights.size(0)
+                    routing_weights = routing_weights.repeat(repeat_factor, 1)[:batch_size]
+            
+            # 標準的MoE結合
+            weights = routing_weights.unsqueeze(-1)
+            expert_outputs_permuted = expert_outputs.permute(1, 0, 2)
+            combined_lora = (expert_outputs_permuted * weights).sum(dim=1)
+            
         else:
-            # フォールバック（想定外の形状、グローバルフラグで1回のみ警告）
-            global _ROUTING_WARNING_LOGGED
-            if not _ROUTING_WARNING_LOGGED:
-                print(f"  ⚠️ 想定外routing_weights形状検出: {routing_weights.shape} (後続の同様警告は省略)")
-                _ROUTING_WARNING_LOGGED = True
-            # エキスパートの平均を使用
-            combined_lora = expert_outputs.mean(dim=0)
+            raise RuntimeError(f"Vision MoE処理エラー: 想定外のexpert_outputs形状 {expert_shape}")
         
         # ベース出力とLoRA補正を結合
         return base_output + combined_lora

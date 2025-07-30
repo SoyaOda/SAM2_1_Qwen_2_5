@@ -208,23 +208,78 @@ def test_enhanced_multiscale_lora():
 
     # 4. 単一スケールテスト
     print("\n🧪 単一スケールForward処理テスト...")
+    
+    # 修正方針準拠: 異常検知モード有効化
+    torch.autograd.set_detect_anomaly(True)
+    print("✅ 勾配異常検知モード有効化")
+    
     try:
         start_time = time.time()
-        with torch.no_grad():
-            outputs = model(
-                images=test_image, 
-                sam_images=test_sam_image,  # SAM2用画像を追加
-                text_input=test_text, 
-                labels=test_labels, 
-                mode='itg'
-            )
+        # 修正方針準拠: 勾配フローテストのためno_grad削除
+        print("🔍 勾配フロー有効化でモデル実行...")
+        outputs = model(
+            images=test_image, 
+            sam_images=test_sam_image,  # SAM2用画像を追加
+            text_input=test_text, 
+            labels=test_labels, 
+            mode='itg'
+        )
         single_scale_time = time.time() - start_time
         print("\n✅ 単一スケールForward成功！")
         print(f"  - マスク形状: {outputs['masks'].shape}")
         print(f"  - テキストロジット形状: {outputs['text_logits'].shape}")
         print(f"  - 視覚特徴形状: {outputs['visual_features'].shape}")
         print(f"  - 推論時間: {single_scale_time:.3f}秒")
-        if 'loss' in outputs:
+        
+        # 修正方針準拠: 損失勾配フロー詳細チェック
+        if 'loss_dict' in outputs:
+            loss_dict = outputs['loss_dict']
+            print(f"\n🔍 [GRAD_CHECK] 損失勾配フロー確認:")
+            
+            total_loss = None
+            for loss_name, loss_value in loss_dict.items():
+                if isinstance(loss_value, torch.Tensor):
+                    print(f"  - {loss_name}: {loss_value.item():.6f}")
+                    print(f"    requires_grad: {loss_value.requires_grad}")
+                    print(f"    grad_fn: {loss_value.grad_fn is not None}")
+                    
+                    if loss_name == 'total_loss':
+                        total_loss = loss_value
+                    
+                    # 勾配フロー確認
+                    if loss_value.requires_grad and loss_value.grad_fn is not None:
+                        print(f"    ✅ {loss_name}: 勾配フロー正常")
+                    else:
+                        print(f"    ❌ {loss_name}: 勾配フロー問題")
+            
+            # 修正方針準拠: バックプロパゲーションテスト
+            if total_loss is not None and total_loss.requires_grad:
+                print(f"\n🔄 [GRAD_TEST] Backward実行テスト...")
+                try:
+                    total_loss.backward()
+                    print("✅ Backward処理成功!")
+                    
+                    # パラメータ勾配確認（一部のみ）
+                    grad_count = 0
+                    for name, param in model.named_parameters():
+                        if param.requires_grad and param.grad is not None:
+                            grad_count += 1
+                            if grad_count <= 3:  # 最初の3個のみ表示
+                                grad_norm = param.grad.norm().item()
+                                print(f"  - {name}: grad_norm={grad_norm:.6f}")
+                    
+                    print(f"✅ 勾配が設定されたパラメータ数: {grad_count}")
+                    if grad_count > 0:
+                        print("🎉 勾配フロー完全成功!")
+                    else:
+                        print("❌ 勾配が設定されたパラメータがありません")
+                        
+                except Exception as backward_error:
+                    print(f"❌ Backward失敗: {backward_error}")
+                    raise backward_error
+            else:
+                print("⚠️ total_lossが見つからないか勾配無効です")
+        elif 'loss' in outputs:
             print(f"  - 損失値: {outputs['loss'].item():.4f}")
         # Q-Former出力確認
         if 'qformer_outputs' in outputs:

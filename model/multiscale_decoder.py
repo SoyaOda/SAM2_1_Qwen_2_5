@@ -352,6 +352,22 @@ class AuxiliaryDecoder(nn.Module):
             nn.Conv2d(hidden_channels, 1, 1)
         )
         
+        # Web調査準拠: DeepLabV3スタイルの学習可能アップサンプリング層
+        # 単純なF.interpolateの代替として学習可能なアップサンプリングを提供
+        self.upsampling_layers = nn.Sequential(
+            # 転置畳み込みによる学習可能アップサンプリング (4x)
+            nn.ConvTranspose2d(1, hidden_channels//4, kernel_size=4, stride=4, bias=False),
+            nn.GroupNorm(8, hidden_channels//4),
+            nn.ReLU(inplace=True),
+            # 細部調整用の畳み込み
+            nn.Conv2d(hidden_channels//4, hidden_channels//8, 3, padding=1),
+            nn.GroupNorm(4, hidden_channels//8),
+            nn.ReLU(inplace=True),
+            # 最終出力
+            nn.Conv2d(hidden_channels//8, 1, 1),
+            nn.Sigmoid()  # マスク値を[0,1]に正規化
+        )
+        
         print(f"✅ AuxiliaryDecoder初期化")
         print(f"  - 入力チャネル: {in_channels}")
         print(f"  - 隠れチャネル: {hidden_channels}")
