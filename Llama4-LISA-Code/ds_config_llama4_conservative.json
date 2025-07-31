@@ -1,0 +1,114 @@
+{
+  "_comment": "Llama4-Scout-17B-16E-Instruct 保守的設定（NCCL Broken Pipe対策）",
+  "_description": "ZeRO Stage 2 + 保守的通信設定 + エラー回避最適化",
+
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": 1,
+  "gradient_accumulation_steps": "auto",
+  "steps_per_print": 1,
+  "wall_clock_breakdown": false,
+
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": "auto",
+      "betas": [0.9, 0.95],
+      "eps": 1e-8,
+      "weight_decay": 1e-2
+    }
+  },
+
+  "scheduler": {
+    "type": "WarmupCosineLR",
+    "params": {
+      "warmup_min_lr": "auto",
+      "warmup_max_lr": "auto",
+      "warmup_num_steps": "auto",
+      "cos_min_lr": 1e-6
+    }
+  },
+
+  "fp16": {
+    "enabled": false
+  },
+
+  "bf16": {
+    "enabled": true,
+    "auto_cast": false,
+    "loss_scale": 0,
+    "initial_scale_power": 16,
+    "loss_scale_window": 1000,
+    "hysteresis": 2,
+    "min_loss_scale": 1
+  },
+
+  "zero_optimization": {
+    "stage": 2,
+    "allgather_partitions": true,
+    "allgather_bucket_size": 5e7,
+    "overlap_comm": false,
+    "reduce_scatter": true,
+    "reduce_bucket_size": 5e7,
+    "contiguous_gradients": true,
+    "round_robin_gradients": false,
+    "offload_optimizer": {
+      "device": "cpu",
+      "pin_memory": true,
+      "buffer_count": 2,
+      "fast_init": false
+    },
+    "offload_param": {
+      "device": "none"
+    }
+  },
+
+  "activation_checkpointing": {
+    "partition_activations": false,
+    "cpu_checkpointing": false,
+    "contiguous_memory_optimization": false,
+    "number_checkpoints": null,
+    "synchronize_checkpoint_boundary": true,
+    "profile": false
+  },
+
+  "gradient_clipping": 1.0,
+  "prescale_gradients": false,
+  "gradient_predivide_factor": 1.0,
+
+  "comms_logger": {
+    "enabled": true,
+    "verbose": true,
+    "prof_all": false,
+    "debug": true
+  },
+
+  "flops_profiler": {
+    "enabled": false,
+    "profile_step": 1,
+    "module_depth": -1,
+    "top_modules": 1,
+    "detailed": false,
+    "output_file": null
+  },
+
+  "monitor_config": {
+    "enabled": true,
+    "tag": "llama4-lisa-conservative",
+    "csv_monitor": {
+      "enabled": true,
+      "output_path": "./monitor_logs/",
+      "job_name": "llama4_lisa_conservative_training"
+    },
+    "wandb": {
+      "enabled": false,
+      "team": null,
+      "group": "llama4-lisa",
+      "project": "llama4-lisa-conservative-training"
+    },
+    "tensorboard": {
+      "enabled": true,
+      "output_path": "./tensorboard_logs/",
+      "job_name": "llama4_lisa_conservative_training"
+    }
+  }
+}

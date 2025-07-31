@@ -1,0 +1,1876 @@
+================================================================================
+LISA-Llama4プロジェクト Utilsフォルダ核心スクリプト集
+生成日時: 2025-07-02 21:46:56
+================================================================================
+
+📌 概要:
+utilsフォルダ内の核心的なファイル（constants.py, conversation.py,
+data_processing.py, dataset.py, utils.py）の完全なソースコードを収録。
+
+📊 統計: 合計 5 ファイル, 69.2KB, 1,781 行
+
+📑 目次:
+
+🔧 核心ユーティリティ:
+  - utils/utils.py (198 行, 6.5KB)
+
+💬 会話・プロンプト処理:
+  - utils/conversation.py (335 行, 11.4KB)
+    Conversation prompt templates.
+
+📊 データ処理・変換:
+  - utils/data_processing.py (171 行, 5.8KB)
+    Gemma-3対応のデータコレーター バッチ処理とパディングを担当
+
+📦 データセット統合:
+  - utils/dataset.py (995 行, 42.3KB)
+    LISA-Gemma3 デュアルストリーム・データパイプライン 仕様書第3章に従った実装
+
+⚙️ 設定・定数:
+  - utils/constants.py (82 行, 3.2KB)
+    LISA-Gemma3プロジェクト用の共通定数定義
+
+================================================================================
+詳細なソースコード
+================================================================================
+
+
+🔧 核心ユーティリティ
+============================================================
+
+📄 ファイル: utils/utils.py
+📏 サイズ: 6.5KB (198 行)
+------------------------------------------------------------
+
+from enum import Enum
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import re
+from typing import Union, List
+
+from transformers import PreTrainedTokenizer
+
+IGNORE_INDEX = -100
+# ✅ Gemma-3は既に画像対応のため、特別な画像トークンインデックスは不要
+# 代わりにオリジナルLISA準拠の設計を使用
+DEFAULT_IMAGE_TOKEN = "<image>"
+DEFAULT_IMAGE_PATCH_TOKEN = "<im_patch>"
+DEFAULT_IM_START_TOKEN = "<im_start>"
+DEFAULT_IM_END_TOKEN = "<im_end>"
+
+SHORT_QUESTION_LIST = [
+    DEFAULT_IMAGE_TOKEN + "\n" + "Can you segment the {class_name} in this image?",
+    DEFAULT_IMAGE_TOKEN + "\n" + "Please segment the {class_name} in this image.",
+    DEFAULT_IMAGE_TOKEN
+    + "\n"
+    + "What is {class_name} in this image? Please respond with segmentation mask.",
+    DEFAULT_IMAGE_TOKEN
+    + "\n"
+    + "What is {class_name} in this image? Please output segmentation mask.",
+]
+
+LONG_QUESTION_LIST = [
+    DEFAULT_IMAGE_TOKEN + "\n" + "{sent} Please respond with segmentation mask.",
+    DEFAULT_IMAGE_TOKEN + "\n" + "{sent} Please output segmentation mask.",
+]
+
+EXPLANATORY_QUESTION_LIST = [
+    "Please output segmentation mask and explain why.",
+    "Please output segmentation mask and explain the reason.",
+    "Please output segmentation mask and give some explanation.",
+]
+
+ANSWER_LIST = [
+    "It is [SEG].",
+    "Sure, [SEG].",
+    "Sure, it is [SEG].",
+    "Sure, the segmentation result is [SEG].",
+    "[SEG].",
+]
+
+
+class Summary(Enum):
+    NONE = 0
+    AVERAGE = 1
+    SUM = 2
+    COUNT = 3
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, name, fmt=":f", summary_type=Summary.AVERAGE):
+        self.name = name
+        self.fmt = fmt
+        self.summary_type = summary_type
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+    def all_reduce(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if isinstance(self.sum, np.ndarray):
+            total = torch.tensor(
+                self.sum.tolist()
+                + [
+                    self.count,
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            total = torch.tensor(
+                [self.sum, self.count], dtype=torch.float32, device=device
+            )
+
+        dist.all_reduce(total, dist.ReduceOp.SUM, async_op=False)
+        if total.shape[0] > 2:
+            self.sum, self.count = total[:-1].cpu().numpy(), total[-1].cpu().item()
+        else:
+            self.sum, self.count = total.tolist()
+        self.avg = self.sum / (self.count + 1e-5)
+
+    def __str__(self):
+        fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
+        return fmtstr.format(**self.__dict__)
+
+    def summary(self):
+        fmtstr = ""
+        if self.summary_type is Summary.NONE:
+            fmtstr = ""
+        elif self.summary_type is Summary.AVERAGE:
+            fmtstr = "{name} {avg:.3f}"
+        elif self.summary_type is Summary.SUM:
+            fmtstr = "{name} {sum:.3f}"
+        elif self.summary_type is Summary.COUNT:
+            fmtstr = "{name} {count:.3f}"
+        else:
+            raise ValueError("invalid summary type %r" % self.summary_type)
+
+        return fmtstr.format(**self.__dict__)
+
+
+def intersectionAndUnionGPU(output, target, K, ignore_index=255):
+    # 'K' classes, output and target sizes are N or N * L or N * H * W, each value in range 0 to K - 1.
+    assert output.dim() in [1, 2, 3]
+    assert output.shape == target.shape
+    output = output.view(-1)
+    target = target.view(-1)
+    output[target == ignore_index] = ignore_index
+    intersection = output[output == target]
+    area_intersection = torch.histc(intersection, bins=K, min=0, max=K - 1)
+    area_output = torch.histc(output, bins=K, min=0, max=K - 1)
+    area_target = torch.histc(target, bins=K, min=0, max=K - 1)
+    area_union = area_output + area_target - area_intersection
+    return area_intersection, area_union, area_target
+
+
+class ProgressMeter(object):
+    def __init__(self, num_batches, meters, prefix=""):
+        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
+        self.meters = meters
+        self.prefix = prefix
+
+    def display(self, batch):
+        entries = [self.prefix + self.batch_fmtstr.format(batch)]
+        entries += [str(meter) for meter in self.meters]
+        print("\t".join(entries))
+
+    def display_summary(self):
+        entries = [" *"]
+        entries += [meter.summary() for meter in self.meters]
+        print(" ".join(entries))
+
+    def _get_batch_fmtstr(self, num_batches):
+        num_digits = len(str(num_batches // 1))
+        fmt = "{:" + str(num_digits) + "d}"
+        return "[" + fmt + "/" + fmt.format(num_batches) + "]"
+
+
+def dict_to_cuda(input_dict):
+    for k, v in input_dict.items():
+        if isinstance(input_dict[k], torch.Tensor):
+            input_dict[k] = v.cuda(non_blocking=True)
+        elif (
+            isinstance(input_dict[k], list)
+            and len(input_dict[k]) > 0
+            and isinstance(input_dict[k][0], torch.Tensor)
+        ):
+            input_dict[k] = [ele.cuda(non_blocking=True) for ele in v]
+    return input_dict
+
+
+def tokenizer_image_token(
+    text: str, 
+    tokenizer: PreTrainedTokenizer, 
+    image_token_index: int = None,  # ✅ Gemma-3では不要だが互換性のため保持
+    return_tensors: str = None
+) -> Union[List[int], torch.Tensor]:
+    """
+    ✅ Gemma-3対応の画像トークン処理関数（修正版）
+    
+    Gemma-3は既に画像対応のため、特別な画像トークン処理は不要。
+    しかし、互換性のためにオリジナルLISA準拠の簡単な処理を提供。
+    """
+    # ✅ Gemma-3では画像は内蔵SigLIPで処理されるため、
+    # 特別な画像トークン展開は不要。単純にテキストトークン化のみ。
+    
+    # 画像トークンを除去してテキストのみをトークン化
+    text_without_image_tokens = text.replace(DEFAULT_IMAGE_TOKEN, "").strip()
+    
+    if not text_without_image_tokens:
+        # テキストが空の場合はデフォルトトークンを返す
+        tokens = tokenizer.encode("", add_special_tokens=True)
+    else:
+        tokens = tokenizer.encode(text_without_image_tokens, add_special_tokens=True)
+    
+    if return_tensors == "pt":
+        return torch.tensor(tokens, dtype=torch.long)
+    
+    return tokens
+
+------------------------------------------------------------
+
+
+💬 会話・プロンプト処理
+============================================================
+
+📄 ファイル: utils/conversation.py
+📏 サイズ: 11.4KB (335 行)
+📝 説明: Conversation prompt templates.
+------------------------------------------------------------
+
+"""
+Conversation prompt templates.
+"""
+
+import dataclasses
+from enum import Enum, auto
+from typing import Any, List
+
+
+class SeparatorStyle(Enum):
+    """Different separator style."""
+
+    ADD_COLON_SINGLE = auto()
+    ADD_COLON_TWO = auto()
+    NO_COLON_SINGLE = auto()
+    BAIZE = auto()
+    DOLLY = auto()
+    RWKV = auto()
+    GEMMA3 = auto()
+
+
+@dataclasses.dataclass
+class Conversation:
+    """A class that keeps all conversation history."""
+
+    # System prompts
+    system: str
+    # Two roles
+    roles: List[str]
+    # All messages
+    messages: List[List[str]]
+    # Offset of few shot examples
+    offset: int
+    # Separator
+    sep_style: SeparatorStyle
+    sep: str
+    sep2: str = None
+    # Stop criteria (the default one is EOS token)
+    stop_str: str = None
+    # Stops generation if meeting any token in this list
+    stop_token_ids: List[int] = None
+
+    # Used for the state in the gradio servers.
+    # TODO(lmzheng): refactor this
+    conv_id: Any = None
+    skip_next: bool = False
+    model_name: str = None
+
+    def get_prompt(self):
+        if self.sep_style == SeparatorStyle.ADD_COLON_SINGLE:
+            ret = self.system + self.sep
+            for role, message in self.messages:
+                if message:
+                    ret += role + ": " + message + self.sep
+                else:
+                    ret += role + ":"
+            return ret
+        elif self.sep_style == SeparatorStyle.ADD_COLON_TWO:
+            seps = [self.sep, self.sep2]
+            ret = self.system + seps[0]
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += role + ": " + message + seps[i % 2]
+                else:
+                    ret += role + ":"
+            return ret
+        elif self.sep_style == SeparatorStyle.NO_COLON_SINGLE:
+            ret = self.system
+            for role, message in self.messages:
+                if message:
+                    ret += role + message + self.sep
+                else:
+                    ret += role
+            return ret
+        elif self.sep_style == SeparatorStyle.BAIZE:
+            ret = self.system + "\n"
+            for role, message in self.messages:
+                if message:
+                    ret += role + message + "\n"
+                else:
+                    ret += role
+            return ret
+        elif self.sep_style == SeparatorStyle.DOLLY:
+            seps = [self.sep, self.sep2]
+            ret = self.system
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += role + ":\n" + message + seps[i % 2]
+                    if i % 2 == 1:
+                        ret += "\n\n"
+                else:
+                    ret += role + ":\n"
+            return ret
+        elif self.sep_style == SeparatorStyle.RWKV:
+            ret = self.system
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += (
+                        role
+                        + ": "
+                        + message.replace("\r\n", "\n").replace("\n\n", "\n")
+                    )
+                    ret += "\n\n"
+                else:
+                    ret += role + ":"
+            return ret
+        elif self.sep_style == SeparatorStyle.GEMMA3:
+            ret = self.system
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += f"<start_of_turn>{role}\n{message}<end_of_turn>\n"
+                else:
+                    ret += f"<start_of_turn>{role}\n"
+            return ret
+        else:
+            raise ValueError(f"Invalid style: {self.sep_style}")
+
+    def append_message(self, role, message):
+        self.messages.append([role, message])
+
+    def to_gradio_chatbot(self):
+        ret = []
+        for i, (role, msg) in enumerate(self.messages[self.offset :]):
+            if i % 2 == 0:
+                ret.append([msg, None])
+            else:
+                ret[-1][-1] = msg
+        return ret
+
+    def copy(self):
+        return Conversation(
+            system=self.system,
+            roles=self.roles,
+            messages=[[x, y] for x, y in self.messages],
+            offset=self.offset,
+            sep_style=self.sep_style,
+            sep=self.sep,
+            sep2=self.sep2,
+            stop_str=self.stop_str,
+            stop_token_ids=self.stop_token_ids,
+            conv_id=self.conv_id,
+            model_name=self.model_name,
+        )
+
+    def dict(self):
+        return {
+            "system": self.system,
+            "roles": self.roles,
+            "messages": self.messages,
+            "offset": self.offset,
+            "conv_id": self.conv_id,
+            "model_name": self.model_name,
+        }
+
+
+# A template with one conversation example
+conv_one_shot = Conversation(
+    system="A chat between a curious human and an artificial intelligence assistant. "
+    "The assistant gives helpful, detailed, and polite answers to the human's questions.",
+    roles=("Human", "Assistant"),
+    messages=(
+        (
+            "Human",
+            "What are the key differences between renewable and non-renewable energy sources?",
+        ),
+        (
+            "Assistant",
+            "Renewable energy sources are those that can be replenished naturally in a relatively "
+            "short amount of time, such as solar, wind, hydro, geothermal, and biomass. "
+            "Non-renewable energy sources, on the other hand, are finite and will eventually be "
+            "depleted, such as coal, oil, and natural gas. Here are some key differences between "
+            "renewable and non-renewable energy sources:\n"
+            "1. Availability: Renewable energy sources are virtually inexhaustible, while non-renewable "
+            "energy sources are finite and will eventually run out.\n"
+            "2. Environmental impact: Renewable energy sources have a much lower environmental impact "
+            "than non-renewable sources, which can lead to air and water pollution, greenhouse gas emissions, "
+            "and other negative effects.\n"
+            "3. Cost: Renewable energy sources can be more expensive to initially set up, but they typically "
+            "have lower operational costs than non-renewable sources.\n"
+            "4. Reliability: Renewable energy sources are often more reliable and can be used in more remote "
+            "locations than non-renewable sources.\n"
+            "5. Flexibility: Renewable energy sources are often more flexible and can be adapted to different "
+            "situations and needs, while non-renewable sources are more rigid and inflexible.\n"
+            "6. Sustainability: Renewable energy sources are more sustainable over the long term, while "
+            "non-renewable sources are not, and their depletion can lead to economic and social instability.",
+        ),
+    ),
+    offset=2,
+    sep_style=SeparatorStyle.ADD_COLON_SINGLE,
+    sep="\n### ",
+    stop_str="###",
+)
+
+
+# Vicuna v1.1 template
+conv_vicuna_v1_1 = Conversation(
+    system="A chat between a curious user and an artificial intelligence assistant. "
+    "The assistant gives helpful, detailed, and polite answers to the user's questions.",
+    roles=("USER", "ASSISTANT"),
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.ADD_COLON_TWO,
+    sep=" ",
+    sep2="</s>",
+)
+
+# Koala default template
+conv_koala_v1 = Conversation(
+    system="BEGINNING OF CONVERSATION:",
+    roles=("USER", "GPT"),
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.ADD_COLON_TWO,
+    sep=" ",
+    sep2="</s>",
+)
+
+# Dolly V2 default template
+conv_dolly = Conversation(
+    system="Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n",
+    roles=("### Instruction", "### Response"),
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.DOLLY,
+    sep="\n\n",
+    sep2="### End",
+)
+
+# OpenAssistant Pythia default template
+conv_oasst = Conversation(
+    system="",
+    roles=("<|prompter|>", "<|assistant|>"),
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.NO_COLON_SINGLE,
+    sep="<|endoftext|>",
+)
+
+# StableLM Alpha default template
+conv_stablelm = Conversation(
+    system="""<|SYSTEM|># StableLM Tuned (Alpha version)
+- StableLM is a helpful and harmless open-source AI language model developed by StabilityAI.
+- StableLM is excited to be able to help the user, but will refuse to do anything that could be considered harmful to the user.
+- StableLM is more than just an information source, StableLM is also able to write poetry, short stories, and make jokes.
+- StableLM will refuse to participate in anything that could harm a human.
+""",
+    roles=("<|USER|>", "<|ASSISTANT|>"),
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.NO_COLON_SINGLE,
+    sep="",
+    stop_token_ids=[50278, 50279, 50277, 1, 0],
+)
+
+# Baize default template
+conv_baize = Conversation(
+    system="The following is a conversation between a human and an AI assistant named Baize (named after a mythical creature in Chinese folklore). Baize is an open-source AI assistant developed by UCSD and Sun Yat-Sen University. The human and the AI assistant take turns chatting. Human statements start with [|Human|] and AI assistant statements start with [|AI|]. The AI assistant always provides responses in as much detail as possible, and in Markdown format. The AI assistant always declines to engage with topics, questions and instructions related to unethical, controversial, or sensitive issues. Complete the transcript in exactly that format.",
+    roles=("[|Human|]", "[|AI|]"),
+    messages=(
+        ("[|Human|]", "Hello!"),
+        ("[|AI|]", "Hi!"),
+    ),
+    offset=2,
+    sep_style=SeparatorStyle.BAIZE,
+    sep="[|Human|]",
+    stop_str="[|Human|]",
+)
+
+# RWKV-4-Raven default template
+conv_rwkv = Conversation(
+    system="",
+    roles=("Bob", "Alice"),
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.RWKV,
+    sep="",
+    stop_str="\n\n",
+)
+
+# Gemma-3 default template
+conv_gemma3 = Conversation(
+    system="",
+    roles=("user", "model"),
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.GEMMA3,
+    sep="<start_of_turn>",
+    sep2="<end_of_turn>",
+    stop_str="<end_of_turn>",
+)
+
+conv_templates = {
+    "baize": conv_baize,
+    "conv_one_shot": conv_one_shot,
+    "dolly": conv_dolly,
+    "koala_v1": conv_koala_v1,
+    "oasst": conv_oasst,
+    "stablelm": conv_stablelm,
+    "vicuna_v1.1": conv_vicuna_v1_1,
+    "rwkv": conv_rwkv,
+    "gemma3": conv_gemma3,
+}
+
+
+def get_default_conv_template(model_name):
+    model_name = model_name.lower()
+    if "gemma" in model_name or "gemma-3" in model_name:
+        return conv_gemma3
+    elif "vicuna" in model_name or "output" in model_name:
+        return conv_vicuna_v1_1
+    elif "koala" in model_name:
+        return conv_koala_v1
+    elif "dolly-v2" in model_name:
+        return conv_dolly
+    elif "oasst" in model_name and "pythia" in model_name:
+        return conv_oasst
+    elif "baize" in model_name:
+        return conv_baize
+    elif "stablelm" in model_name:
+        return conv_stablelm
+    elif "rwkv-4" in model_name:
+        return conv_rwkv
+    return conv_one_shot
+
+
+if __name__ == "__main__":
+    conv = conv_templates["vicuna_v1.1"].copy()
+    conv.append_message(conv.roles[0], "Hello!")
+    conv.append_message(conv.roles[1], "Hi!")
+    conv.append_message(conv.roles[0], "How are you?")
+    conv.append_message(conv.roles[1], None)
+    print(conv.get_prompt())
+
+# デフォルト会話テンプレート（LISA互換）
+default_conversation = conv_gemma3
+
+------------------------------------------------------------
+
+
+📊 データ処理・変換
+============================================================
+
+📄 ファイル: utils/data_processing.py
+📏 サイズ: 5.8KB (171 行)
+📝 説明: Gemma-3対応のデータコレーター バッチ処理とパディングを担当
+------------------------------------------------------------
+
+import glob
+import json
+import os
+
+import cv2
+import numpy as np
+import torch
+from typing import Dict, List, Any
+
+
+class DataCollatorForSupervisedDataset:
+    """
+    Gemma-3対応のデータコレーター
+    バッチ処理とパディングを担当
+    """
+    def __init__(self, tokenizer, pad_to_multiple_of=None):
+        self.tokenizer = tokenizer
+        self.pad_to_multiple_of = pad_to_multiple_of
+        
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """
+        バッチデータの処理
+        """
+        # 入力データの抽出
+        input_ids_list = []
+        attention_mask_list = []
+        labels_list = []
+        images_sam_list = []
+        images_gemma_list = []
+        masks_list = []
+        
+        for item in batch:
+            if 'input_ids' in item:
+                input_ids_list.append(item['input_ids'])
+            if 'attention_mask' in item:
+                attention_mask_list.append(item['attention_mask'])
+            if 'labels' in item:
+                labels_list.append(item['labels'])
+            if 'image_sam' in item:
+                images_sam_list.append(item['image_sam'])
+            if 'image_gemma' in item:
+                images_gemma_list.append(item['image_gemma'])
+            if 'ground_truth_mask' in item:
+                masks_list.append(item['ground_truth_mask'])
+        
+        # パディング処理
+        batch_output = {}
+        
+        # テキストのパディング
+        if input_ids_list:
+            padded = self.tokenizer.pad(
+                {'input_ids': input_ids_list},
+                padding=True,
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                return_tensors='pt'
+            )
+            batch_output['input_ids'] = padded['input_ids']
+            
+            # attention_maskの処理
+            if attention_mask_list:
+                batch_output['attention_mask'] = padded.get('attention_mask')
+            
+            # labelsのパディング（IGNORE_INDEX=-100）
+            if labels_list:
+                max_len = batch_output['input_ids'].size(1)
+                padded_labels = []
+                for labels in labels_list:
+                    if len(labels) < max_len:
+                        # -100でパディング
+                        padded = torch.cat([
+                            labels,
+                            torch.full((max_len - len(labels),), -100, dtype=labels.dtype)
+                        ])
+                        padded_labels.append(padded)
+                    else:
+                        padded_labels.append(labels[:max_len])
+                batch_output['labels'] = torch.stack(padded_labels)
+        
+        # 画像のスタック
+        if images_sam_list:
+            batch_output['images_sam'] = torch.stack(images_sam_list)
+        if images_gemma_list:
+            batch_output['images_gemma'] = torch.stack(images_gemma_list)
+        if masks_list:
+            batch_output['masks'] = torch.stack(masks_list)
+        
+        return batch_output
+
+
+def get_mask_from_json(json_path, img):
+    try:
+        with open(json_path, "r") as r:
+            anno = json.loads(r.read())
+    except:
+        with open(json_path, "r", encoding="cp1252") as r:
+            anno = json.loads(r.read())
+
+    inform = anno["shapes"]
+    comments = anno["text"]
+    is_sentence = anno["is_sentence"]
+
+    height, width = img.shape[:2]
+
+    ### sort polies by area
+    area_list = []
+    valid_poly_list = []
+    for i in inform:
+        label_id = i["label"]
+        points = i["points"]
+        if "flag" == label_id.lower():  ## meaningless deprecated annotations
+            continue
+
+        tmp_mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.polylines(tmp_mask, np.array([points], dtype=np.int32), True, 1, 1)
+        cv2.fillPoly(tmp_mask, np.array([points], dtype=np.int32), 1)
+        tmp_area = tmp_mask.sum()
+
+        area_list.append(tmp_area)
+        valid_poly_list.append(i)
+
+    ### ground-truth mask
+    sort_index = np.argsort(area_list)[::-1].astype(np.int32)
+    sort_index = list(sort_index)
+    sort_inform = []
+    for s_idx in sort_index:
+        sort_inform.append(valid_poly_list[s_idx])
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for i in sort_inform:
+        label_id = i["label"]
+        points = i["points"]
+
+        if "ignore" in label_id.lower():
+            label_value = 255  # ignored during evaluation
+        else:
+            label_value = 1  # target
+
+        cv2.polylines(mask, np.array([points], dtype=np.int32), True, label_value, 1)
+        cv2.fillPoly(mask, np.array([points], dtype=np.int32), label_value)
+
+    return mask, comments, is_sentence
+
+
+if __name__ == "__main__":
+    data_dir = "./train"
+    vis_dir = "./vis"
+
+    if not os.path.exists(vis_dir):
+        os.makedirs(vis_dir)
+
+    json_path_list = sorted(glob.glob(data_dir + "/*.json"))
+    for json_path in json_path_list:
+        img_path = json_path.replace(".json", ".jpg")
+        img = cv2.imread(img_path)[:, :, ::-1]
+
+        # In generated mask, value 1 denotes valid target region, and value 255 stands for region ignored during evaluaiton.
+        mask, comments, is_sentence = get_mask_from_json(json_path, img)
+
+        ## visualization. Green for target, and red for ignore.
+        valid_mask = (mask == 1).astype(np.float32)[:, :, None]
+        ignore_mask = (mask == 255).astype(np.float32)[:, :, None]
+        vis_img = img * (1 - valid_mask) * (1 - ignore_mask) + (
+            (np.array([0, 255, 0]) * 0.6 + img * 0.4) * valid_mask
+            + (np.array([255, 0, 0]) * 0.6 + img * 0.4) * ignore_mask
+        )
+        vis_img = np.concatenate([img, vis_img], 1)
+        vis_path = os.path.join(
+            vis_dir, json_path.split("/")[-1].replace(".json", ".jpg")
+        )
+        cv2.imwrite(vis_path, vis_img[:, :, ::-1])
+        print("Visualization has been saved to: ", vis_path)
+
+------------------------------------------------------------
+
+
+📦 データセット統合
+============================================================
+
+📄 ファイル: utils/dataset.py
+📏 サイズ: 42.3KB (995 行)
+📝 説明: LISA-Gemma3 デュアルストリーム・データパイプライン 仕様書第3章に従った実装
+------------------------------------------------------------
+
+"""
+LISA-Gemma3 デュアルストリーム・データパイプライン
+仕様書第3章に従った実装
+"""
+
+import glob
+import os
+import random
+from typing import Dict, List, Tuple, Optional, Any
+import json
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+import torch.utils.data
+from pycocotools import mask
+from transformers import AutoProcessor
+from torchvision import transforms
+
+from .conversation import get_default_conv_template
+from .data_processing import get_mask_from_json
+from .reason_seg_dataset import ReasonSegDataset
+from .refer import REFER
+from .refer_seg_dataset import ReferSegDataset
+from .sem_seg_dataset import SemSegDataset
+from .vqa_dataset import VQADataset
+
+# 設定ファイルの動的インポート
+def get_config():
+    """実行時の設定ファイルを動的に取得"""
+    try:
+        # 環境変数から設定ファイルを指定可能
+        config_path = os.environ.get('LISA_CONFIG_PATH', 'config_linux')
+        
+        # 小規模テスト用設定を優先的に試行
+        if os.path.exists('config_small_test.py'):
+            import config_small_test as config
+            print("設定: config_small_test.py を使用")
+            return config
+        
+        # 通常の設定ファイル
+        if config_path == 'config_linux' and os.path.exists('config_linux.py'):
+            import config_linux as config
+            print("設定: config_linux.py を使用")
+            return config
+        
+        # カスタム設定ファイル
+        if config_path != 'config_linux':
+            import importlib
+            config = importlib.import_module(config_path)
+            print(f"設定: {config_path}.py を使用")
+            return config
+            
+    except ImportError as e:
+        print(f"設定ファイルのインポートに失敗: {e}")
+        
+    # フォールバック: デフォルト設定
+    print("警告: 設定ファイルが見つかりません。デフォルト設定を使用します。")
+    class DefaultConfig:
+        MODEL_MAX_LENGTH = 2048
+        GEMMA_IMAGE_SIZE = 896
+        SAM_IMAGE_SIZE = 1024
+        SEG_TOKEN = "[SEG]"
+        DATASET_BASE_DIR = "./dataset"
+    
+    return DefaultConfig()
+
+# 設定を取得
+config = get_config()
+
+# デフォルト設定
+DEFAULT_IMAGE_TOKEN = "<image>"
+DEFAULT_SEG_TOKEN = getattr(config, 'SEG_TOKEN', "[SEG]")
+IGNORE_INDEX = -100
+
+def setup_seg_token(tokenizer, seg_token="[SEG]"):
+    """
+    オリジナルLISA準拠の[SEG]トークンセットアップ
+    一元化された処理でフォールバックなし
+    """
+    # オリジナルLISA準拠: tokenizer.add_tokens("[SEG]")
+    num_added_tokens = tokenizer.add_tokens(seg_token)
+    # オリジナルLISA準拠: tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+    seg_token_idx = tokenizer(seg_token, add_special_tokens=False).input_ids[0]
+    
+    print(f"[SEG]トークンセットアップ完了:")
+    print(f"  - 追加されたトークン数: {num_added_tokens}")
+    print(f"  - [SEG]トークンID: {seg_token_idx}")
+    
+    return seg_token_idx
+
+def preprocess_sam_image(image: Image.Image, target_size: Optional[int] = None) -> torch.Tensor:
+    """
+    SAM用画像前処理：1024x1024にリサイズ・パディング・正規化
+    """
+    if target_size is None:
+        target_size = getattr(config, 'SAM_IMAGE_SIZE', 1024)
+    
+    # 1. 最長辺を1024にリサイズ
+    w, h = image.size
+    if max(w, h) != target_size:
+        if w > h:
+            new_w, new_h = target_size, int(h * target_size / w)
+        else:
+            new_w, new_h = int(w * target_size / h), target_size
+        image = image.resize((new_w, new_h), Image.LANCZOS)
+    
+    # 2. 1024x1024にパディング
+    w, h = image.size
+    pad_w = (target_size - w) // 2
+    pad_h = (target_size - h) // 2
+    
+    # パディング用の新しい画像を作成
+    padded_image = Image.new('RGB', (target_size, target_size), (0, 0, 0))
+    padded_image.paste(image, (pad_w, pad_h))
+    
+    # 3. テンソル化と正規化
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[123.675/255, 116.28/255, 103.53/255],  # SAMの標準正規化値
+            std=[58.395/255, 57.12/255, 57.375/255]
+        )
+    ])
+    
+    return transform(padded_image)
+
+def preprocess_gemma_image(image: Image.Image, processor: AutoProcessor, target_size: Optional[int] = None) -> torch.Tensor:
+    """
+    Gemma用画像前処理：896x896にリサイズ・正規化
+    """
+    if target_size is None:
+        target_size = getattr(config, 'GEMMA_IMAGE_SIZE', 896)
+    
+    # AutoProcessorを使用してGemma用前処理
+    try:
+        processed = processor(images=image, return_tensors="pt")
+        image_tensor = processed['pixel_values'].squeeze(0)  # (1, C, H, W) -> (C, H, W)
+        return image_tensor
+    except Exception as e:
+        print(f"Gemma画像前処理エラー: {e}")
+        # フォールバック: 手動前処理
+        image_resized = image.resize((target_size, target_size), Image.LANCZOS)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+        return transform(image_resized)
+
+
+
+def build_correct_labels_for_gemma3(input_ids: torch.Tensor, tokenizer) -> torch.Tensor:
+    """
+    Gemma3チャットテンプレートに準拠した正確なラベルマスキング
+    
+    Args:
+        input_ids: トークンID列 [seq_len]
+        tokenizer: Gemma3用トークナイザー
+    
+    Returns:
+        正確にマスクされたラベル [seq_len]
+    """
+    labels = input_ids.clone()
+    input_ids_list = input_ids.tolist()
+    
+    # 特殊トークンIDを取得
+    user_turn_start = None
+    model_turn_start = None
+    turn_end = None
+    
+    # トークナイザーから特殊トークンIDを取得
+    for token_str, token_id in tokenizer.get_vocab().items():
+        if token_str == "<start_of_turn>":
+            user_turn_start = model_turn_start = token_id
+        elif token_str == "<end_of_turn>":
+            turn_end = token_id
+    
+    # フォールバック: ハードコーディングされた値
+    if user_turn_start is None:
+        user_turn_start = model_turn_start = getattr(tokenizer, 'convert_tokens_to_ids', lambda x: None)("<start_of_turn>")
+    if turn_end is None:
+        turn_end = getattr(tokenizer, 'convert_tokens_to_ids', lambda x: None)("<end_of_turn>")
+    
+    # user/modelトークンのID
+    user_token_id = getattr(tokenizer, 'convert_tokens_to_ids', lambda x: None)("user")
+    model_token_id = getattr(tokenizer, 'convert_tokens_to_ids', lambda x: None)("model")
+    
+    # シーケンス全体を-100で初期化（デフォルトでマスク）
+    labels.fill_(-100)
+    
+    i = 0
+    while i < len(input_ids_list):
+        # <start_of_turn>を探す
+        if input_ids_list[i] == user_turn_start:  # <start_of_turn>
+            if i + 1 < len(input_ids_list):
+                next_token = input_ids_list[i + 1]
+                
+                if next_token == model_token_id:
+                    # modelターンの場合: <start_of_turn>model から <end_of_turn> まで
+                    # modelトークンの直後から予測開始
+                    start_pred = i + 2  # <start_of_turn>model の次から
+                    
+                    # 対応する<end_of_turn>を探す
+                    j = start_pred
+                    while j < len(input_ids_list) and input_ids_list[j] != turn_end:
+                        j += 1
+                    
+                    # modelの応答部分を予測対象に
+                    if j < len(input_ids_list):  
+                        # <end_of_turn>が見つかった場合: start_pred から end_of_turn の直前まで
+                        labels[start_pred:j] = input_ids[start_pred:j]
+                        i = j + 1  # <end_of_turn>の次へ
+                    else:
+                        # <end_of_turn>が見つからない場合（最後のmodelターン）: シーケンス末尾まで
+                        # PADトークンは除外
+                        end_pos = len(input_ids_list)
+                        while end_pos > start_pred and input_ids_list[end_pos - 1] == 0:  # PADトークン除外
+                            end_pos -= 1
+                        if end_pos > start_pred:
+                            labels[start_pred:end_pos] = input_ids[start_pred:end_pos]
+                        i = len(input_ids_list)  # ループ終了
+                elif next_token == user_token_id:
+                    # userターンの場合: 完全にマスク（何もしない、既に-100）
+                    # 対応する<end_of_turn>を探して飛ばす
+                    j = i + 2  # <start_of_turn>user の次から
+                    while j < len(input_ids_list) and input_ids_list[j] != turn_end:
+                        j += 1
+                    i = j + 1  # <end_of_turn>の次へ
+                else:
+                    i += 1
+            else:
+                i += 1
+        else:
+            i += 1
+    
+    return labels
+
+def preprocess_mask(mask: np.ndarray, target_size: Optional[int] = None) -> torch.Tensor:
+    """
+    マスクの前処理
+    """
+    if target_size is None:
+        target_size = getattr(config, 'SAM_IMAGE_SIZE', 1024)
+    
+    if isinstance(mask, torch.Tensor):
+        mask = mask.cpu().numpy()
+    
+    # マスクの形状を検証
+    if mask.size == 0:
+        raise ValueError("空のマスクです")
+    
+    if mask.ndim < 2:
+        raise ValueError(f"マスクの次元が不正です: {mask.ndim}D (最低2D必要)")
+    
+    # マスクを2次元に変換
+    if mask.ndim == 2:
+        h, w = mask.shape
+        mask_2d = mask
+    elif mask.ndim == 3:
+        if mask.shape[0] == 1:  # (1, H, W)
+            mask_2d = mask[0]
+            h, w = mask_2d.shape
+        elif mask.shape[-1] == 1:  # (H, W, 1)
+            mask_2d = mask[:, :, 0]
+            h, w = mask_2d.shape
+        elif mask.shape[0] == 3 or mask.shape[-1] == 3:  # RGB マスク
+            # RGB マスクの場合、最初のチャンネルを使用
+            if mask.shape[0] == 3:  # (3, H, W)
+                mask_2d = mask[0]
+                h, w = mask_2d.shape
+            else:  # (H, W, 3)
+                mask_2d = mask[:, :, 0]
+                h, w = mask_2d.shape
+        else:
+            # その他の場合、最後の2次元を使用
+            mask_2d = mask.reshape(-1, mask.shape[-2], mask.shape[-1])[0]
+            h, w = mask_2d.shape
+    else:
+        raise ValueError(f"サポートされていないマスクの次元: {mask.ndim}D")
+    
+    # サイズの検証
+    if h == 0 or w == 0:
+        raise ValueError(f"無効なマスクサイズ: {h}x{w}")
+    
+    # マスクのリサイズ（OpenCVのバグ回避のためPillowを使用）
+    if (h, w) != (target_size, target_size):
+        try:
+            # numpy -> PIL Image -> リサイズ -> numpy
+            mask_uint8 = mask_2d.astype(np.uint8)
+            mask_pil = Image.fromarray(mask_uint8, mode='L')  # グレースケール
+            mask_resized_pil = mask_pil.resize((target_size, target_size), Image.NEAREST)
+            mask_2d = np.array(mask_resized_pil)
+        except Exception as e:
+            raise ValueError(f"マスクリサイズ失敗 (元サイズ: {h}x{w}, target: {target_size}x{target_size}): {e}")
+    
+    # テンソル化 (常に1次元追加して (1, H, W) 形式にする)
+    if mask_2d.ndim == 2:
+        mask_2d = mask_2d[None, ...]  # (H, W) -> (1, H, W)
+    
+    return torch.from_numpy(mask_2d).float()
+
+class HybridDataset(torch.utils.data.Dataset):
+    """
+    仕様書第3章.2 HybridDatasetの実装
+    デュアルストリーム処理：Gemma用とSAM用の2系統前処理を同時実行
+    """
+
+    def __init__(
+        self,
+        base_image_dir: Optional[str] = None,
+        gemma_processor: Optional[AutoProcessor] = None,
+        samples_per_epoch: int = 500 * 8 * 2 * 10,
+        precision: str = "bf16",
+        gemma_image_size: Optional[int] = None,
+        sam_image_size: Optional[int] = None,
+        num_classes_per_sample: int = 3,
+        exclude_val: bool = False,
+        dataset: str = "sem_seg||refer_seg||vqa||reason_seg",
+        sample_rate: List[float] = [9, 3, 3, 1],
+        sem_seg_data: Optional[str] = None,
+        refer_seg_data: Optional[str] = None,
+        vqa_data: Optional[str] = None,
+        reason_seg_data: Optional[str] = None,
+        explanatory: float = 0.1,
+    ):
+        # 設定ファイルからパラメータを取得（引数で指定されていない場合）
+        self.base_image_dir = base_image_dir or getattr(config, 'DATASET_BASE_DIR', './dataset')
+        self.gemma_processor = gemma_processor
+        self.samples_per_epoch = samples_per_epoch
+        self.precision = precision
+        self.gemma_image_size = gemma_image_size or getattr(config, 'GEMMA_IMAGE_SIZE', 896)
+        self.sam_image_size = sam_image_size or getattr(config, 'SAM_IMAGE_SIZE', 1024)
+        self.num_classes_per_sample = num_classes_per_sample
+        self.exclude_val = exclude_val
+        self.explanatory = explanatory
+        
+        # データセット設定を設定ファイルから取得
+        self.sem_seg_data = sem_seg_data or getattr(config, 'SEM_SEG_DATA', "ade20k||cocostuff")
+        self.refer_seg_data = refer_seg_data or getattr(config, 'REFER_SEG_DATA', "refcoco||refcoco+||refcocog")
+        self.vqa_data = vqa_data or getattr(config, 'VQA_DATA', "llava_instruct_150k")
+        self.reason_seg_data = reason_seg_data or getattr(config, 'REASON_SEG_DATA', "ReasonSeg|train")
+        
+        # サンプルレートの正規化
+        sample_rate = np.array(sample_rate)
+        self.sample_rate = sample_rate / sample_rate.sum()
+
+        # [SEG]トークンの一元セットアップ（オリジナルLISA準拠）
+        if self.gemma_processor and self.gemma_processor.tokenizer:
+            self.seg_token = getattr(config, 'SEG_TOKEN', '[SEG]')
+            self.seg_token_idx = setup_seg_token(self.gemma_processor.tokenizer, self.seg_token)
+            self.max_length = getattr(config, 'MODEL_MAX_LENGTH', 2048)
+        else:
+            raise ValueError("gemma_processor は必須です")
+
+        # データセットの初期化
+        self.datasets = dataset.split("||")
+        self.all_datasets = []
+        
+        print(f"HybridDataset初期化:")
+        print(f"  - ベースディレクトリ: {self.base_image_dir}")
+        print(f"  - Gemma画像サイズ: {self.gemma_image_size}")
+        print(f"  - SAM画像サイズ: {self.sam_image_size}")
+        print(f"  - 対象データセット: {self.datasets}")
+        
+        # Semantic Segmentation Dataset
+        if "sem_seg" in self.datasets:
+            print(f"  - Semantic Segmentation: {self.sem_seg_data}")
+            try:
+                self.all_datasets.append(
+                    SemSegDataset(
+                        self.base_image_dir,
+                        self.gemma_processor.tokenizer,
+                        None,  # vision_tower は使用しない
+                        samples_per_epoch,
+                        precision,
+                        self.gemma_image_size,
+                        num_classes_per_sample,
+                        exclude_val,
+                        self.sem_seg_data,
+                    )
+                )
+            except Exception as e:
+                print(f"    警告: Semantic Segmentationデータセットの初期化に失敗: {e}")
+        
+        # Referring Segmentation Dataset
+        if "refer_seg" in self.datasets:
+            print(f"  - Referring Segmentation: {self.refer_seg_data}")
+            try:
+                self.all_datasets.append(
+                    ReferSegDataset(
+                        self.base_image_dir,
+                        self.gemma_processor.tokenizer,
+                        None,  # vision_tower は使用しない
+                        samples_per_epoch,
+                        precision,
+                        self.gemma_image_size,
+                        num_classes_per_sample,
+                        exclude_val,
+                        self.refer_seg_data,
+                    )
+                )
+            except Exception as e:
+                print(f"    警告: Referring Segmentationデータセットの初期化に失敗: {e}")
+        
+        # VQA Dataset
+        if "vqa" in self.datasets:
+            print(f"  - VQA: {self.vqa_data}")
+            try:
+                self.all_datasets.append(
+                    VQADataset(
+                        self.base_image_dir,
+                        self.gemma_processor.tokenizer,
+                        None,  # vision_tower は使用しない
+                        samples_per_epoch,
+                        precision,
+                        self.gemma_image_size,
+                        exclude_val,
+                        self.vqa_data,
+                    )
+                )
+            except Exception as e:
+                print(f"    警告: VQAデータセットの初期化に失敗: {e}")
+        
+        # Reasoning Segmentation Dataset
+        if "reason_seg" in self.datasets:
+            print(f"  - Reasoning Segmentation: {self.reason_seg_data}")
+            try:
+                self.all_datasets.append(
+                    ReasonSegDataset(
+                        base_image_dir=self.base_image_dir,
+                        tokenizer=self.gemma_processor.tokenizer,
+                        vision_tower=None,  # vision_tower は使用しない
+                        samples_per_epoch=samples_per_epoch,
+                        precision=precision,
+                        image_size=self.gemma_image_size,
+                        num_classes_per_sample=num_classes_per_sample,
+                        exclude_val=exclude_val,
+                        reason_seg_data=self.reason_seg_data,
+                        explanatory=explanatory,
+                    )
+                )
+            except Exception as e:
+                print(f"    警告: Reasoning Segmentationデータセットの初期化に失敗: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        print(f"✅ HybridDataset初期化完了: {len(self.all_datasets)} データセット")
+        
+        # sample_rateとdataset数の一致を確保
+        if len(self.sample_rate) != len(self.all_datasets):
+            print(f"⚠️  sample_rate調整: {len(self.sample_rate)} -> {len(self.all_datasets)}")
+            if len(self.all_datasets) == 0:
+                raise ValueError("有効なデータセットが1つもありません")
+            elif len(self.all_datasets) == 1:
+                self.sample_rate = [1.0]
+            else:
+                # 利用可能なデータセット数に合わせてsample_rateを正規化
+                original_sample_rate = self.sample_rate[:len(self.all_datasets)]
+                total_rate = sum(original_sample_rate)
+                self.sample_rate = [rate / total_rate for rate in original_sample_rate]
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    def __getitem__(self, idx) -> Dict[str, Any]:
+        """
+        統合データセットからサンプルを取得
+        仕様書第3章.2準拠のデュアルストリーム・データパイプライン
+        """
+        # データセットをサンプリング比率に従って選択
+        dataset_idx = np.random.choice(len(self.all_datasets), p=self.sample_rate)
+        selected_dataset = self.all_datasets[dataset_idx]
+        
+        # 選択されたデータセットからサンプルを取得
+        try:
+            sample = selected_dataset[idx % len(selected_dataset)]
+        except Exception as e:
+            print(f"データセット取得エラー: {e}")
+            # フォールバック: 最初のデータセットから取得
+            sample = self.all_datasets[0][0]
+        
+        # サンプルの形式を確認
+        if len(sample) == 9:
+            # 新しい9要素形式（SemSegDataset, ReferSegDataset）
+            image_path, image_sam, image_gemma, conversations, masks, label, resize, questions, sampled_classes = sample
+            
+            # conversationsからテキストプロンプトを抽出
+            if isinstance(conversations, list) and len(conversations) > 0:
+                text_prompt = conversations[0]  # 最初の会話を使用
+            else:
+                text_prompt = "Segment the object in this image. [SEG]"
+            
+            # resize と questions, sampled_classes を保持（オリジナルLISAとの互換性）
+            resize = resize if 'resize' in locals() else None
+            questions = questions if 'questions' in locals() else None
+            sampled_classes = sampled_classes if 'sampled_classes' in locals() else None
+            
+        elif len(sample) == 5:
+            # 古い5要素形式（VQADataset, ReasonSegDataset）
+            image_path, image_data, text_prompt, masks, label = sample
+            
+            # 画像データの処理
+            if isinstance(image_data, torch.Tensor):
+                # 既に前処理済みの場合
+                if image_data.dim() == 3 and image_data.size(0) == 3:
+                    # (C, H, W) → (H, W, C)
+                    image_np = image_data.permute(1, 2, 0).cpu().numpy()
+                    if image_np.max() <= 1.0:
+                        image_np = (image_np * 255).astype(np.uint8)
+                else:
+                    image_np = image_data.cpu().numpy()
+                
+                # 形状の検証
+                if len(image_np.shape) >= 2 and (image_np.shape[0] <= 1 or image_np.shape[1] <= 1):
+                    raise ValueError(f"無効な画像サイズ: {image_np.shape}")
+                
+                # データ型の検証と変換
+                if image_np.dtype == np.float32 or image_np.dtype == np.float64:
+                    # float型の場合、0-1範囲を0-255に変換してuint8に
+                    if image_np.max() <= 1.0:
+                        image_np = (image_np * 255).astype(np.uint8)
+                    else:
+                        # 既に0-255範囲の場合
+                        image_np = image_np.astype(np.uint8)
+                elif image_np.dtype != np.uint8:
+                    # その他の型の場合はuint8に変換
+                    image_np = image_np.astype(np.uint8)
+                
+                # PIL画像に変換
+                image_pil = Image.fromarray(image_np)
+                
+            elif isinstance(image_data, Image.Image):
+                image_pil = image_data
+            else:
+                # numpyまたはその他の形式
+                if hasattr(image_data, 'shape'):
+                    # データ型の検証と変換
+                    if image_data.dtype == np.float32 or image_data.dtype == np.float64:
+                        if image_data.max() <= 1.0:
+                            image_data = (image_data * 255).astype(np.uint8)
+                        else:
+                            image_data = image_data.astype(np.uint8)
+                    elif image_data.dtype != np.uint8:
+                        image_data = image_data.astype(np.uint8)
+                    
+                    image_pil = Image.fromarray(image_data)
+                else:
+                    raise ValueError(f"サポートされていない画像形式: {type(image_data)}")
+            
+            # デュアル前処理
+            image_gemma = preprocess_gemma_image(image_pil, self.gemma_processor, self.gemma_image_size)
+            image_sam = preprocess_sam_image(image_pil, self.sam_image_size)
+            
+            # オリジナルLISAとの互換性のために初期化
+            resize = None
+            questions = None
+            sampled_classes = None
+            
+        else:
+            raise ValueError(f"不明なサンプル形式: {len(sample)} 要素")
+        
+
+
+        # [SEG]トークンが含まれていることを確認
+        if self.seg_token not in text_prompt:
+            text_prompt += f" {self.seg_token}"
+
+        # Gemma-3の正しいマルチモーダル処理
+        # PIL画像を準備
+        if len(sample) == 9:
+            # 新しい9要素形式の場合、既にPIL画像がある
+            if isinstance(image_sam, torch.Tensor):
+                # SAM画像テンソルからPIL画像を復元
+                if image_sam.dim() == 3:  # (C, H, W)
+                    image_np = image_sam.permute(1, 2, 0).cpu().numpy()
+                    if image_np.max() <= 1.0:
+                        image_np = (image_np * 255).astype(np.uint8)
+                    
+                    # 形状の検証
+                    if image_np.shape[0] == 1 or image_np.shape[1] == 1:
+                        raise ValueError(f"無効な画像サイズ: {image_np.shape}")
+                    
+                    # データ型の検証と変換
+                    if image_np.dtype == np.float32 or image_np.dtype == np.float64:
+                        if image_np.max() <= 1.0:
+                            image_np = (image_np * 255).astype(np.uint8)
+                        else:
+                            image_np = image_np.astype(np.uint8)
+                    elif image_np.dtype != np.uint8:
+                        image_np = image_np.astype(np.uint8)
+                    
+                    image_pil = Image.fromarray(image_np)
+                else:
+                    raise ValueError(f"無効なテンソル次元: {image_sam.dim()}")
+            else:
+                if isinstance(image_sam, Image.Image):
+                    image_pil = image_sam
+                else:
+                    raise ValueError(f"サポートされていない画像形式: {type(image_sam)}")
+        else:
+            # 5要素形式の場合、既にimage_pilが準備されている
+            pass
+        
+        # Gemma-3の公式apply_chat_templateを使用
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image_pil},
+                    {"type": "text", "text": text_prompt}
+                ]
+            }
+        ]
+        
+        try:
+            # Gemma-3プロセッサーでマルチモーダル処理
+            gemma_processed = self.gemma_processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt"
+            )
+            
+            # 処理結果から必要な要素を抽出
+            input_ids = gemma_processed['input_ids'].squeeze(0)
+            attention_mask = gemma_processed['attention_mask'].squeeze(0)
+            pixel_values = gemma_processed['pixel_values'].squeeze(0)
+            
+            # pixel_valuesをimage_gemmaとして使用
+            image_gemma = pixel_values
+            
+            # SAM用画像を別途処理
+            image_sam = preprocess_sam_image(image_pil, self.sam_image_size)
+            
+        except Exception as e:
+            print(f"❌ Gemma-3マルチモーダル処理エラー: {e}")
+            print(f"   テキスト: {text_prompt[:100]}...")
+            raise RuntimeError(f"Gemma-3マルチモーダル処理に失敗: {e}")
+
+        # 画像の形状を確認（apply_chat_templateで処理済みなので基本的に正しい形状）
+        if image_gemma.dim() == 4:  # (1, C, H, W) → (C, H, W)
+            image_gemma = image_gemma.squeeze(0)
+        
+        if image_sam.dim() == 4:  # (1, C, H, W) → (C, H, W)
+            image_sam = image_sam.squeeze(0)
+
+        # [SEG]トークンの位置を特定（オリジナルLISA準拠）
+        seg_token_mask = (input_ids == self.seg_token_idx)
+
+        # ラベルの処理（言語生成用）
+        # Gemma3チャットテンプレートに準拠した正確なラベルマスキング
+        labels = build_correct_labels_for_gemma3(input_ids, self.gemma_processor.tokenizer)
+
+        # マスクの処理
+        has_mask = masks is not None
+        if has_mask:
+            if isinstance(masks, torch.Tensor):
+                if masks.dim() == 2:  # (H, W) → (1, H, W)
+                    ground_truth_mask = masks.unsqueeze(0)
+                elif masks.dim() == 3:  # (N, H, W) → 最初のマスクを使用
+                    ground_truth_mask = masks[0:1]  # (1, H, W)
+                else:
+                    ground_truth_mask = masks
+            else:
+                # numpy配列の場合
+                if isinstance(masks, np.ndarray):
+                    ground_truth_mask = torch.from_numpy(masks)
+                    if ground_truth_mask.dim() == 2:
+                        ground_truth_mask = ground_truth_mask.unsqueeze(0)
+                else:
+                    ground_truth_mask = torch.zeros(1, self.sam_image_size, self.sam_image_size)
+                    has_mask = False
+            
+            # マスクのサイズ調整
+            if ground_truth_mask.size(-1) != self.sam_image_size or ground_truth_mask.size(-2) != self.sam_image_size:
+                ground_truth_mask = F.interpolate(
+                    ground_truth_mask.unsqueeze(0).float(),
+                    size=(self.sam_image_size, self.sam_image_size),
+                    mode='nearest'
+                ).squeeze(0)
+        else:
+            ground_truth_mask = torch.zeros(1, self.sam_image_size, self.sam_image_size)
+
+        # 返り値の構築（仕様書準拠、オリジナルLISAとの互換性を保持）
+        # collate_fnが期待するキー名に統一
+        return {
+            'input_ids': input_ids,
+            'labels': labels,
+            'attention_mask': attention_mask,
+            'images_for_sam': image_sam,      # SAM用画像 (C, 1024, 1024)
+            'images_for_gemma': image_gemma,  # Gemma用画像 (C, 896, 896)
+            'ground_truth_mask': ground_truth_mask if has_mask else None,
+            'has_mask': has_mask,
+            'seg_token_mask': seg_token_mask,
+            'image_path': image_path if 'image_path' in locals() else None,
+            'text_prompt': text_prompt,  # 追加: collate_fn用
+            # オリジナルLISAとの互換性のための追加フィールド
+            'resize': resize if 'resize' in locals() else None,
+            'questions': questions if 'questions' in locals() else None,
+            'sampled_classes': sampled_classes if 'sampled_classes' in locals() else None,
+        }
+
+def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
+    """
+    仕様書第3章.3 バッチの結合 (collate_fn)
+    デュアルストリーム対応のカスタムcollate関数
+    
+    最大シーケンス長は設定ファイルのMODEL_MAX_LENGTHを自動的に使用:
+    - config_small_test.py が利用可能な場合: 512 (メモリ効率優先)
+    - config_linux.py のみの場合: 2048 (通常設定)
+    - 設定ファイルなしの場合: 2048 (デフォルト)
+    """
+    # 設定の取得
+    config = get_config()
+    sam_image_size = getattr(config, 'SAM_IMAGE_SIZE', 1024)
+    # 各キーごとにデータを収集
+    images_for_gemma = []
+    images_for_sam = []
+    input_ids = []
+    attention_masks = []
+    labels = []
+    seg_token_masks = []
+    ground_truth_masks = []
+    has_masks = []
+    image_paths = []
+    text_prompts = []
+    resize_list = []  # オリジナルLISA互換
+    questions_list = []  # オリジナルLISA互換
+    sampled_classes_list = []  # オリジナルLISA互換
+    
+    for item in batch:
+        images_for_gemma.append(item["images_for_gemma"])
+        images_for_sam.append(item["images_for_sam"])
+        input_ids.append(item["input_ids"])
+        attention_masks.append(item["attention_mask"])
+        
+        # labelsの処理（正確なラベルマスキング適用済み）
+        label = item["labels"]
+        if isinstance(label, torch.Tensor):
+            # トークンレベルのラベル（言語生成）の場合
+            if label.dim() == 1 and len(label) == item["input_ids"].size(0):
+                labels.append(label)  # build_correct_labels_for_gemma3で処理済み
+            elif label.dim() == 0:  # スカラーテンソル
+                # スカラーラベルの場合は全シーケンスに同じラベルを適用（通常はしない）
+                labels.append(torch.full_like(item["input_ids"], label.item()))
+            else:
+                # その他の場合はinput_idsと同じ長さのダミーラベル
+                labels.append(torch.full_like(item["input_ids"], -100))
+        else:
+            # 非テンソルの場合
+            labels.append(torch.full_like(item["input_ids"], -100))
+        
+        seg_token_masks.append(item["seg_token_mask"])
+        if item.get("has_mask", False):
+            ground_truth_masks.append(item["ground_truth_mask"])
+        has_masks.append(item.get("has_mask", False))
+        image_paths.append(item.get("image_path"))
+        text_prompts.append(item.get("text_prompt"))
+        
+        # オリジナルLISA互換フィールド
+        resize_list.append(item.get("resize"))
+        questions_list.append(item.get("questions"))
+        sampled_classes_list.append(item.get("sampled_classes"))
+    
+    # テンソルのスタック
+    images_for_gemma = torch.stack(images_for_gemma)  # (B, 3, 896, 896)
+    images_for_sam = torch.stack(images_for_sam)      # (B, 3, 1024, 1024)
+    
+    # テキストシーケンスの長さ統一（パディング）
+    max_length = max(ids.size(0) for ids in input_ids)
+    
+    # パディング関数の定義
+    def pad_sequence(sequences, max_len, pad_value=0):
+        padded = []
+        for seq in sequences:
+            if seq.size(0) < max_len:
+                padding = torch.full((max_len - seq.size(0),), pad_value, dtype=seq.dtype)
+                padded_seq = torch.cat([seq, padding])
+            else:
+                padded_seq = seq[:max_len]  # 切り詰め
+            padded.append(padded_seq)
+        return torch.stack(padded)
+    
+    # シーケンスをパディング
+    input_ids_padded = pad_sequence(input_ids, max_length, pad_value=0)
+    attention_masks_padded = pad_sequence(attention_masks, max_length, pad_value=0)
+    labels_padded = pad_sequence(labels, max_length, pad_value=-100)  # -100でパディング
+    seg_token_masks_padded = pad_sequence(seg_token_masks, max_length, pad_value=False)
+    
+    # マスクが存在するサンプルのみをスタック
+    if ground_truth_masks:
+        ground_truth_masks_stacked = torch.stack(ground_truth_masks)
+    else:
+        ground_truth_masks_stacked = None
+
+    # オリジナルLISA互換のlabel_listを生成（セグメンテーション用）
+    label_list = []
+    for has_mask in has_masks:
+        if has_mask:
+            # マスクがある場合、ignore_label=255のラベルマップを作成
+            label_list.append(torch.ones(1, sam_image_size, sam_image_size) * 255)
+        else:
+            label_list.append(None)
+
+    return {
+        # Gemma-3デュアルストリーム用
+        "images_for_gemma": images_for_gemma,           # (B, 3, 896, 896)
+        "images_for_sam": images_for_sam,               # (B, 3, 1024, 1024)
+        "input_ids": input_ids_padded,                  # (B, unified_max_length)
+        "attention_masks": attention_masks_padded,      # (B, unified_max_length) - オリジナルLISA準拠の命名
+        "labels": labels_padded,                        # (B, unified_max_length) - 正確にマスク済み
+        "seg_token_mask": seg_token_masks_padded,      # (B, unified_max_length)
+        "ground_truth_mask": ground_truth_masks_stacked,# (num_masks, 1, 1024, 1024) or None
+        "has_mask": has_masks,                          # List[bool]
+        "image_paths": image_paths,                     # List[str]
+        "text_prompts": text_prompts,                   # List[str]
+        # オリジナルLISA互換フィールド
+        "masks_list": ground_truth_masks,               # List[Tensor] - オリジナルLISA形式
+        "label_list": label_list,                       # List[Tensor] - オリジナルLISA形式
+        "resize_list": resize_list,                     # List[Optional[Any]]
+        "questions_list": questions_list,               # List[Optional[Any]]
+        "sampled_classes_list": sampled_classes_list,   # List[Optional[Any]]
+        # 追加の互換性フィールド
+        "images": images_for_sam,                       # エイリアス: オリジナルLISAでの名前
+        "images_clip": images_for_gemma,                # エイリアス: オリジナルLISAでCLIP画像として使用
+    }
+
+# エイリアスは削除 - 明確な命名を使用
+# 正式名称を使用してください:
+# - HybridDataset (統合データセット)
+# - collate_fn (バッチ結合関数)
+
+class LisaGemma3ValDataset(torch.utils.data.Dataset):
+    """
+    LISA-Gemma3用の評価データセット
+    デュアルストリーム対応
+    """
+
+    def __init__(
+        self,
+        base_image_dir: str,
+        gemma_processor: AutoProcessor,
+        val_dataset: str,
+        gemma_image_size: int = 896,
+        sam_image_size: int = 1024,
+    ):
+        self.base_image_dir = base_image_dir
+        self.gemma_processor = gemma_processor
+        self.gemma_image_size = gemma_image_size
+        self.sam_image_size = sam_image_size
+        
+        # 評価用データセットの初期化
+        if "refer_seg" in val_dataset.lower():
+            self.dataset = ReferSegDataset(
+                base_image_dir,
+                gemma_processor,
+                None,
+                1000,  # サンプル数
+                "bf16",
+                gemma_image_size,
+                3,
+                False,
+                val_dataset,
+            )
+        elif "sem_seg" in val_dataset.lower():
+            self.dataset = SemSegDataset(
+                base_image_dir,
+                gemma_processor,
+                None,
+                1000,  # サンプル数
+                "bf16",
+                gemma_image_size,
+                3,
+                False,
+                val_dataset,
+            )
+        else:
+            # ReasonSegをデフォルトとする
+            self.dataset = ReasonSegDataset(
+                        base_image_dir,
+                gemma_processor,
+                None,
+                1000,
+                "bf16",
+                gemma_image_size,
+                3,
+                False,
+                "ReasonSeg|val",
+            )
+
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx) -> Dict[str, Any]:
+        """評価用サンプルの取得（デュアルストリーム対応）"""
+        sample = self.dataset[idx]
+        
+        # 訓練用データセットと同じ形式で処理
+        if len(sample) < 4:
+            raise ValueError(f"評価データセットのサンプル形式が不正です: {len(sample)} 要素 (最低4要素必要)")
+        
+        image_path = sample[0]
+        image = sample[1]
+        text_prompt = sample[2] if len(sample) > 2 else "Segment the object in this image. [SEG]"
+        mask = sample[3] if len(sample) > 3 else None
+        label = sample[4] if len(sample) > 4 else torch.tensor(0)
+        
+        # 画像の型変換
+        if isinstance(image, torch.Tensor):
+            if image.dim() == 3:
+                image = image.permute(1, 2, 0)
+            image = image.cpu().numpy()
+            if image.dtype != np.uint8:
+                image = (image * 255).astype(np.uint8)
+            image = Image.fromarray(image)
+        elif isinstance(image, np.ndarray):
+            if image.dtype != np.uint8:
+                image = (image * 255).astype(np.uint8)
+            image = Image.fromarray(image)
+        elif not isinstance(image, Image.Image):
+            raise TypeError(f"サポートされていない画像型: {type(image)}")
+        
+        # 画像サイズの検証
+        if image.size[0] == 0 or image.size[1] == 0:
+            raise ValueError(f"無効な画像サイズ: {image.size}")
+        
+        # デュアルストリーム前処理（訓練用と同じ）
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": text_prompt}
+                ]
+            }
+        ]
+        
+        try:
+            gemma_processed = self.gemma_processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt"
+            )
+        except Exception as e:
+            raise RuntimeError(f"評価用Gemma前処理に失敗 (idx={idx}): {e}")
+        
+        images_for_gemma = gemma_processed['pixel_values'].squeeze(0)
+        input_ids = gemma_processed['input_ids'].squeeze(0)
+        attention_mask = gemma_processed['attention_mask'].squeeze(0)
+        
+        try:
+            images_for_sam = preprocess_sam_image(image, self.sam_image_size)
+        except Exception as e:
+            raise RuntimeError(f"評価用SAM前処理に失敗 (idx={idx}): {e}")
+        
+        seg_token_id = self.gemma_processor.tokenizer.convert_tokens_to_ids("[SEG]")
+        if seg_token_id is None:
+            raise ValueError("[SEG]トークンがトークナイザーに見つかりません")
+        
+        seg_token_mask = (input_ids == seg_token_id)
+        
+        # マスクの処理
+        has_mask = mask is not None and (isinstance(mask, (torch.Tensor, np.ndarray)) and mask.sum() > 0)
+        if has_mask:
+            try:
+                if isinstance(mask, torch.Tensor):
+                    mask_np = mask.cpu().numpy()
+                else:
+                    mask_np = np.array(mask)
+                ground_truth_mask = preprocess_mask(mask_np, self.sam_image_size)
+            except Exception as e:
+                raise RuntimeError(f"評価用マスク前処理に失敗 (idx={idx}): {e}")
+        else:
+            ground_truth_mask = torch.zeros(1, self.sam_image_size, self.sam_image_size)
+        
+        if not isinstance(label, torch.Tensor):
+            label = torch.tensor(label)
+        
+        return {
+            "images_for_gemma": images_for_gemma,
+            "images_for_sam": images_for_sam,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": label,
+            "seg_token_mask": seg_token_mask,
+            "ground_truth_mask": ground_truth_mask,
+            "has_mask": has_mask,
+            "image_path": image_path,
+            "text_prompt": text_prompt,
+        }
+
+------------------------------------------------------------
+
+
+⚙️ 設定・定数
+============================================================
+
+📄 ファイル: utils/constants.py
+📏 サイズ: 3.2KB (82 行)
+📝 説明: LISA-Gemma3プロジェクト用の共通定数定義
+------------------------------------------------------------
+
+"""
+LISA-Gemma3プロジェクト用の共通定数定義
+"""
+
+# デフォルトトークン
+DEFAULT_IMAGE_TOKEN = "<image>"
+DEFAULT_IM_START_TOKEN = "<im_start>"
+DEFAULT_IM_END_TOKEN = "<im_end>"
+DEFAULT_SEG_TOKEN = "[SEG]"
+
+# Gemma-3のチャットテンプレート用トークン
+GEMMA_START_OF_TURN = "<start_of_turn>"
+GEMMA_END_OF_TURN = "<end_of_turn>"
+GEMMA_BOS_TOKEN = "<bos>"
+GEMMA_EOS_TOKEN = "<eos>"
+
+# 無視すべきインデックス
+IGNORE_INDEX = -100
+
+# ✅ 仕様書準拠の正しい設計：
+# Gemma-3-4b-itは既に画像対応（SigLIP内蔵）のため、
+# 独自の画像トークン256個の予約は不要。
+# SEGトークン1個のみを追加し、語彙サイズは最小限に抑える。
+SEG_TOKEN = "[SEG]"  # オリジナルLISAと同じ形式
+
+# ❌ 削除された不要な設定：
+# GEMMA_IMAGE_TOKEN_NUM = 256  # 不要な画像トークン予約（削除）
+# IMAGE_TOKEN_INDEX = 262146   # 不要な画像インデックス（削除）
+
+# システムプロンプト
+SYSTEM_PROMPT = """You are a helpful assistant that can analyze images and understand visual content. You can describe what you see in images and answer questions about them."""
+
+GEMMA_SYSTEM_PROMPT = """You are a helpful assistant that can analyze images and perform segmentation tasks. When asked to segment objects, you should respond with the [SEG] token."""
+
+# Gemma-3専用システムプロンプト
+GEMMA3_SEGMENTATION_PROMPT = """You are LISA (Large-language Instructed Segmentation Assistant), a multimodal AI assistant that can understand images and perform precise object segmentation. When asked to segment objects or regions in images, respond with the [SEG] token to indicate the segmentation mask."""
+
+GEMMA3_VQA_PROMPT = """You are a helpful multimodal AI assistant that can analyze images and answer questions about visual content. Provide accurate, detailed responses based on what you observe in the images."""
+
+# 質問テンプレート
+SHORT_QUESTION_LIST = [
+    "Can you segment the {class_name} in this image?",
+    "Please segment the {class_name}.",
+    "Where is the {class_name}? Please segment it.",
+    "Can you identify and segment the {class_name}?",
+    "Please provide a segmentation mask for the {class_name}.",
+]
+
+LONG_QUESTION_LIST = [
+    "Can you segment the region described as: {sent}?",
+    "Please segment the area that matches: {sent}",
+    "Where is the region that {sent}? Please segment it.",
+    "Can you identify and segment the area described as: {sent}?",
+    "Please provide a segmentation mask for the region: {sent}",
+]
+
+EXPLANATORY_QUESTION_LIST = [
+    "Can you explain why this region is important?",
+    "What makes this area significant?",
+    "Why should we focus on this region?",
+    "What is special about this area?",
+    "Can you provide reasoning for this segmentation?",
+]
+
+ANSWER_LIST = [
+    "It is [SEG].",
+    "Sure, [SEG].",
+    "Sure, it is [SEG].",
+    "Sure, the segmentation result is [SEG].",
+    "[SEG].",
+]
+
+# 画像前処理の定数
+SAM_PIXEL_MEAN = [123.675, 116.28, 103.53]
+SAM_PIXEL_STD = [58.395, 57.12, 57.375]
+SAM_IMAGE_SIZE = 1024
+GEMMA_IMAGE_SIZE = 896
+
+# デフォルト設定
+DEFAULT_IGNORE_LABEL = 255
+DEFAULT_NUM_CLASSES_PER_SAMPLE = 3
+DEFAULT_SAMPLES_PER_EPOCH = 500 * 8 * 2 * 10 
+
+------------------------------------------------------------
+

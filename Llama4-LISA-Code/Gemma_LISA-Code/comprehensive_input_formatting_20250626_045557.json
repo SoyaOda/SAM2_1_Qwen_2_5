@@ -1,0 +1,446 @@
+{
+  "session_id": "20250626_045557",
+  "total_datasets": 12,
+  "samples_per_dataset": 1,
+  "dataset_results": {
+    "sem_seg_ade20k": {
+      "dataset_name": "sem_seg_ade20k",
+      "dataset_type": "sem_seg",
+      "sub_dataset": "ade20k",
+      "total_samples": 1,
+      "successful_samples": 1,
+      "failed_samples": 0,
+      "token_statistics": [
+        {
+          "sample_idx": 0,
+          "sequence_length": 292,
+          "non_pad_tokens": 292,
+          "labeled_tokens": 7,
+          "user_turn_tokens": 277,
+          "model_turn_tokens": 14,
+          "special_tokens": {},
+          "label_masking_ratio": 0.023972602739726026
+        }
+      ],
+      "label_masking_results": [
+        {
+          "sample_idx": 0,
+          "is_correct": true,
+          "error_count": 0,
+          "errors": []
+        }
+      ],
+      "processing_time": 18.193991661071777,
+      "errors": [],
+      "statistics": {
+        "avg_sequence_length": 292.0,
+        "avg_labeled_tokens": 7.0,
+        "seg_detection_rate": 0.0,
+        "success_rate": 1.0
+      }
+    },
+    "sem_seg_cocostuff": {
+      "dataset_name": "sem_seg_cocostuff",
+      "dataset_type": "sem_seg",
+      "sub_dataset": "cocostuff",
+      "total_samples": 1,
+      "successful_samples": 1,
+      "failed_samples": 0,
+      "token_statistics": [
+        {
+          "sample_idx": 0,
+          "sequence_length": 291,
+          "non_pad_tokens": 291,
+          "labeled_tokens": 7,
+          "user_turn_tokens": 276,
+          "model_turn_tokens": 14,
+          "special_tokens": {},
+          "label_masking_ratio": 0.024054982817869417
+        }
+      ],
+      "label_masking_results": [
+        {
+          "sample_idx": 0,
+          "is_correct": true,
+          "error_count": 0,
+          "errors": []
+        }
+      ],
+      "processing_time": 117.9193377494812,
+      "errors": [],
+      "statistics": {
+        "avg_sequence_length": 291.0,
+        "avg_labeled_tokens": 7.0,
+        "seg_detection_rate": 0.0,
+        "success_rate": 1.0
+      }
+    },
+    "sem_seg_mapillary": {
+      "dataset_name": "sem_seg_mapillary",
+      "dataset_type": "sem_seg",
+      "sub_dataset": "mapillary",
+      "total_samples": 1,
+      "successful_samples": 1,
+      "failed_samples": 0,
+      "token_statistics": [
+        {
+          "sample_idx": 0,
+          "sequence_length": 296,
+          "non_pad_tokens": 296,
+          "labeled_tokens": 7,
+          "user_turn_tokens": 281,
+          "model_turn_tokens": 14,
+          "special_tokens": {},
+          "label_masking_ratio": 0.02364864864864865
+        }
+      ],
+      "label_masking_results": [
+        {
+          "sample_idx": 0,
+          "is_correct": true,
+          "error_count": 0,
+          "errors": []
+        }
+      ],
+      "processing_time": 18.66379427909851,
+      "errors": [],
+      "statistics": {
+        "avg_sequence_length": 296.0,
+        "avg_labeled_tokens": 7.0,
+        "seg_detection_rate": 0.0,
+        "success_rate": 1.0
+      }
+    },
+    "sem_seg_pascal_part": {
+      "dataset_name": "sem_seg_pascal_part",
+      "dataset_type": "sem_seg",
+      "sub_dataset": "pascal_part",
+      "total_samples": 1,
+      "successful_samples": 1,
+      "failed_samples": 0,
+      "token_statistics": [
+        {
+          "sample_idx": 0,
+          "sequence_length": 295,
+          "non_pad_tokens": 295,
+          "labeled_tokens": 4,
+          "user_turn_tokens": 283,
+          "model_turn_tokens": 11,
+          "special_tokens": {},
+          "label_masking_ratio": 0.013559322033898305
+        }
+      ],
+      "label_masking_results": [
+        {
+          "sample_idx": 0,
+          "is_correct": true,
+          "error_count": 0,
+          "errors": []
+        }
+      ],
+      "processing_time": 1.7844350337982178,
+      "errors": [],
+      "statistics": {
+        "avg_sequence_length": 295.0,
+        "avg_labeled_tokens": 4.0,
+        "seg_detection_rate": 0.0,
+        "success_rate": 1.0
+      }
+    },
+    "sem_seg_paco_lvis": {
+      "dataset_name": "sem_seg_paco_lvis",
+      "dataset_type": "sem_seg",
+      "sub_dataset": "paco_lvis",
+      "total_samples": 1,
+      "successful_samples": 1,
+      "failed_samples": 0,
+      "token_statistics": [
+        {
+          "sample_idx": 0,
+          "sequence_length": 301,
+          "non_pad_tokens": 301,
+          "labeled_tokens": 9,
+          "user_turn_tokens": 284,
+          "model_turn_tokens": 16,
+          "special_tokens": {},
+          "label_masking_ratio": 0.029900332225913623
+        }
+      ],
+      "label_masking_results": [
+        {
+          "sample_idx": 0,
+          "is_correct": true,
+          "error_count": 0,
+          "errors": []
+        }
+      ],
+      "processing_time": 9.06226134300232,
+      "errors": [],
+      "statistics": {
+        "avg_sequence_length": 301.0,
+        "avg_labeled_tokens": 9.0,
+        "seg_detection_rate": 0.0,
+        "success_rate": 1.0
+      }
+    },
+    "refer_seg_refcoco": {
+      "dataset_name": "refer_seg_refcoco",
+      "dataset_type": "refer_seg",
+      "sub_dataset": "refcoco",
+      "total_samples": 1,
+      "successful_samples": 1,
+      "failed_samples": 0,
+      "token_statistics": [
+        {
+          "sample_idx": 0,
+          "sequence_length": 296,
+          "non_pad_tokens": 296,
+          "labeled_tokens": 7,
+          "user_turn_tokens": 281,
+          "model_turn_tokens": 14,
+          "special_tokens": {},
+          "label_masking_ratio": 0.02364864864864865
+        }
+      ],
+      "label_masking_results": [
+        {
+          "sample_idx": 0,
+          "is_correct": true,
+          "error_count": 0,
+          "errors": []
+        }
+      ],
+      "processing_time": 16.743918418884277,
+      "errors": [],
+      "statistics": {
+        "avg_sequence_length": 296.0,
+        "avg_labeled_tokens": 7.0,
+        "seg_detection_rate": 0.0,
+        "success_rate": 1.0
+      }
+    },
+    "refer_seg_refcoco+": {
+      "dataset_name": "refer_seg_refcoco+",
+      "dataset_type": "refer_seg",
+      "sub_dataset": "refcoco+",
+      "total_samples": 1,
+      "successful_samples": 1,
+      "failed_samples": 0,
+      "token_statistics": [
+        {
+          "sample_idx": 0,
+          "sequence_length": 291,
+          "non_pad_tokens": 291,
+          "labeled_tokens": 4,
+          "user_turn_tokens": 279,
+          "model_turn_tokens": 11,
+          "special_tokens": {},
+          "label_masking_ratio": 0.013745704467353952
+        }
+      ],
+      "label_masking_results": [
+        {
+          "sample_idx": 0,
+          "is_correct": true,
+          "error_count": 0,
+          "errors": []
+        }
+      ],
+      "processing_time": 8.77004075050354,
+      "errors": [],
+      "statistics": {
+        "avg_sequence_length": 291.0,
+        "avg_labeled_tokens": 4.0,
+        "seg_detection_rate": 0.0,
+        "success_rate": 1.0
+      }
+    },
+    "refer_seg_refcocog": {
+      "dataset_name": "refer_seg_refcocog",
+      "dataset_type": "refer_seg",
+      "sub_dataset": "refcocog",
+      "total_samples": 1,
+      "successful_samples": 1,
+      "failed_samples": 0,
+      "token_statistics": [
+        {
+          "sample_idx": 0,
+          "sequence_length": 299,
+          "non_pad_tokens": 299,
+          "labeled_tokens": 7,
+          "user_turn_tokens": 284,
+          "model_turn_tokens": 14,
+          "special_tokens": {},
+          "label_masking_ratio": 0.023411371237458192
+        }
+      ],
+      "label_masking_results": [
+        {
+          "sample_idx": 0,
+          "is_correct": true,
+          "error_count": 0,
+          "errors": []
+        }
+      ],
+      "processing_time": 17.42230749130249,
+      "errors": [],
+      "statistics": {
+        "avg_sequence_length": 299.0,
+        "avg_labeled_tokens": 7.0,
+        "seg_detection_rate": 0.0,
+        "success_rate": 1.0
+      }
+    },
+    "refer_seg_refclef": {
+      "dataset_name": "refer_seg_refclef",
+      "dataset_type": "refer_seg",
+      "sub_dataset": "refclef",
+      "total_samples": 1,
+      "successful_samples": 1,
+      "failed_samples": 0,
+      "token_statistics": [
+        {
+          "sample_idx": 0,
+          "sequence_length": 301,
+          "non_pad_tokens": 301,
+          "labeled_tokens": 9,
+          "user_turn_tokens": 284,
+          "model_turn_tokens": 16,
+          "special_tokens": {},
+          "label_masking_ratio": 0.029900332225913623
+        }
+      ],
+      "label_masking_results": [
+        {
+          "sample_idx": 0,
+          "is_correct": true,
+          "error_count": 0,
+          "errors": []
+        }
+      ],
+      "processing_time": 13.448771476745605,
+      "errors": [],
+      "statistics": {
+        "avg_sequence_length": 301.0,
+        "avg_labeled_tokens": 9.0,
+        "seg_detection_rate": 0.0,
+        "success_rate": 1.0
+      }
+    },
+    "vqa_llava_instruct_150k": {
+      "dataset_name": "vqa_llava_instruct_150k",
+      "dataset_type": "vqa",
+      "sub_dataset": "llava_instruct_150k",
+      "total_samples": 1,
+      "successful_samples": 1,
+      "failed_samples": 0,
+      "token_statistics": [
+        {
+          "sample_idx": 0,
+          "sequence_length": 732,
+          "non_pad_tokens": 732,
+          "labeled_tokens": 368,
+          "user_turn_tokens": 341,
+          "model_turn_tokens": 390,
+          "special_tokens": {},
+          "label_masking_ratio": 0.5027322404371585
+        }
+      ],
+      "label_masking_results": [
+        {
+          "sample_idx": 0,
+          "is_correct": true,
+          "error_count": 0,
+          "errors": []
+        }
+      ],
+      "processing_time": 2.6680612564086914,
+      "errors": [],
+      "statistics": {
+        "avg_sequence_length": 732.0,
+        "avg_labeled_tokens": 368.0,
+        "seg_detection_rate": 0.0,
+        "success_rate": 1.0
+      }
+    },
+    "reason_seg_ReasonSeg_train": {
+      "dataset_name": "reason_seg_ReasonSeg_train",
+      "dataset_type": "reason_seg",
+      "sub_dataset": "ReasonSeg|train",
+      "total_samples": 1,
+      "successful_samples": 1,
+      "failed_samples": 0,
+      "token_statistics": [
+        {
+          "sample_idx": 0,
+          "sequence_length": 322,
+          "non_pad_tokens": 322,
+          "labeled_tokens": 7,
+          "user_turn_tokens": 307,
+          "model_turn_tokens": 14,
+          "special_tokens": {},
+          "label_masking_ratio": 0.021739130434782608
+        }
+      ],
+      "label_masking_results": [
+        {
+          "sample_idx": 0,
+          "is_correct": true,
+          "error_count": 0,
+          "errors": []
+        }
+      ],
+      "processing_time": 1.2789959907531738,
+      "errors": [],
+      "statistics": {
+        "avg_sequence_length": 322.0,
+        "avg_labeled_tokens": 7.0,
+        "seg_detection_rate": 0.0,
+        "success_rate": 1.0
+      }
+    },
+    "reason_seg_ReasonSeg_val": {
+      "dataset_name": "reason_seg_ReasonSeg_val",
+      "dataset_type": "reason_seg",
+      "sub_dataset": "ReasonSeg|val",
+      "total_samples": 1,
+      "successful_samples": 1,
+      "failed_samples": 0,
+      "token_statistics": [
+        {
+          "sample_idx": 0,
+          "sequence_length": 331,
+          "non_pad_tokens": 331,
+          "labeled_tokens": 7,
+          "user_turn_tokens": 316,
+          "model_turn_tokens": 14,
+          "special_tokens": {},
+          "label_masking_ratio": 0.021148036253776436
+        }
+      ],
+      "label_masking_results": [
+        {
+          "sample_idx": 0,
+          "is_correct": true,
+          "error_count": 0,
+          "errors": []
+        }
+      ],
+      "processing_time": 1.3481948375701904,
+      "errors": [],
+      "statistics": {
+        "avg_sequence_length": 331.0,
+        "avg_labeled_tokens": 7.0,
+        "seg_detection_rate": 0.0,
+        "success_rate": 1.0
+      }
+    }
+  },
+  "summary": {
+    "successful_datasets": 12,
+    "failed_datasets": 0,
+    "total_samples": 12,
+    "successful_samples": 12,
+    "total_processing_time": 227.3043715953827
+  }
+}

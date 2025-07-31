@@ -1,0 +1,45 @@
+{
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  "steps_per_print": 10,
+
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": "auto",
+      "betas": [0.9, 0.95],
+      "eps": 1e-8,
+      "weight_decay": 1e-2
+    }
+  },
+
+  "scheduler": {
+    "type": "WarmupLR",
+    "params": {
+      "warmup_min_lr": "auto",
+      "warmup_max_lr": "auto",
+      "warmup_num_steps": "auto"
+    }
+  },
+
+  "fp16": {
+    "enabled": false
+  },
+  "bf16": {
+    "enabled": true
+  },
+
+  "zero_optimization": {
+    "stage": 2,
+    "offload_optimizer": {"device": "none"},
+    "contiguous_gradients": true,
+    "overlap_comm": true,
+    "reduce_bucket_size": 5e8
+  },
+
+  "gradient_clipping": 1.0,
+  "wall_clock_breakdown": false,
+  
+  "_comment": "ローカル環境用設定: CUDA不整合問題回避のためCPUオフロード無効化"
+} 

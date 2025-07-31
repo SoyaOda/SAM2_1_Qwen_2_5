@@ -1,0 +1,52 @@
+# Gemma3-LISA DeepSpeed実行コマンド
+# オリジナルLISAと同様の方式でDeepSpeedを使用するためのコマンド例
+
+# 基本コマンド
+deepspeed --master_port=24999 train_full_ds.py \
+  --version="google/gemma-3-4b-it" \
+  --dataset_dir="H:/download/LISA-dataset/dataset" \
+  --vision_pretrained="C:/Users/oda/foodlmm-llama/weights/sam_vit_h_4b8939.pth" \
+  --dataset="sem_seg||refer_seg||vqa||reason_seg" \
+  --sample_rates="9,3,3,1" \
+  --exp_name="lisa-gemma3-ds" \
+  --deepspeed_config="ds_config.json" \
+  --use_mm_start_end \
+  --train_mask_decoder \
+  --gradient_checkpointing \
+  --precision="bf16"
+
+# 応用：LoRA設定付きのコマンド
+deepspeed --master_port=24999 train_full_ds.py \
+  --version="google/gemma-3-4b-it" \
+  --dataset_dir="H:/download/LISA-dataset/dataset" \
+  --vision_pretrained="C:/Users/oda/foodlmm-llama/weights/sam_vit_h_4b8939.pth" \
+  --dataset="sem_seg||refer_seg||vqa||reason_seg" \
+  --sample_rates="9,3,3,1" \
+  --exp_name="lisa-gemma3-ds-lora" \
+  --lora_r=8 \
+  --lora_alpha=16 \
+  --lora_dropout=0.05 \
+  --lora_target_modules="q_proj,k_proj,v_proj" \
+  --deepspeed_config="ds_config.json" \
+  --use_mm_start_end \
+  --train_mask_decoder \
+  --gradient_checkpointing \
+  --precision="bf16"
+
+# デバッグモード（少量データでのテスト）
+deepspeed --master_port=24999 train_full_ds.py \
+  --version="google/gemma-3-4b-it" \
+  --dataset_dir="H:/download/LISA-dataset/dataset" \
+  --vision_pretrained="C:/Users/oda/foodlmm-llama/weights/sam_vit_h_4b8939.pth" \
+  --dataset="sem_seg" \
+  --sem_seg_data="ade20k" \
+  --sample_rates="1" \
+  --exp_name="lisa-gemma3-ds-debug" \
+  --steps_per_epoch=10 \
+  --epochs=1 \
+  --debug \
+  --deepspeed_config="ds_config.json" \
+  --use_mm_start_end \
+  --train_mask_decoder \
+  --gradient_checkpointing \
+  --precision="bf16" 
