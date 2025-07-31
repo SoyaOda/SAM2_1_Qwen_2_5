@@ -322,24 +322,12 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
                     if target in module_name:
                         matched_modules.append(module_name)
             print(f"  - マッチしたモジュール数: {len(matched_modules)}個（例: {matched_modules[:3] if matched_modules else 'なし'}...）")
-        # 標準SAM2モードの場合
-        elif hasattr(self.segmentation_head, 'predictor') and hasattr(self.segmentation_head.predictor, 'model'):
-            actual_model = self.segmentation_head.predictor.model
-            if hasattr(actual_model, 'image_encoder'):
-                target_encoder = actual_model.image_encoder
-                print(f"  - LoRA注入対象: SAM2Wrapper.predictor.model.image_encoder")
-            else:
-                print(f"  ⚠️ SAM2 predictor.modelにimage_encoderが見つかりません")
-        # フォールバック: sam_wrapperプロパティ経由
-        elif hasattr(self.segmentation_head, 'sam_wrapper'):
-            sam_wrapper = self.segmentation_head.sam_wrapper
-            if hasattr(sam_wrapper, 'predictor') and hasattr(sam_wrapper.predictor, 'model'):
-                actual_model = sam_wrapper.predictor.model
-                if hasattr(actual_model, 'image_encoder'):
-                    target_encoder = actual_model.image_encoder
-                    print(f"  - LoRA注入対象: sam_wrapper.predictor.model.image_encoder")
-            else:
-                print(f"  ⚠️ sam_wrapper predictor.modelにimage_encoderが見つかりません")
+        # Web調査準拠: SAM2ImagePredictorの正規アクセス方法使用
+        else:
+            sam2_model = self._get_sam2_model()
+            if sam2_model is not None and hasattr(sam2_model, 'image_encoder'):
+                target_encoder = sam2_model.image_encoder
+                print(f"  - LoRA注入対象: SAM2ImagePredictor.image_encoder (Web調査準拠)")
         if target_encoder is None:
             print(f"  ⚠️ LoRA注入をスキップ: image_encoderが見つかりません")
             print(f"  - segmentation_head type: {type(self.segmentation_head)}")
@@ -693,20 +681,61 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
         return sam2_devices
 
     def debug_sam2_device_status(self):
-        """SAM2の詳細デバイス状況確認"""
+        """SAM2の詳細デバイス状況確認（Web調査準拠の正規アクセス）"""
         print("🔍 SAM2デバイス状況詳細確認:")
         
-        if hasattr(self.segmentation_head, 'predictor') and hasattr(self.segmentation_head.predictor, 'model'):
-            sam2_model = self.segmentation_head.predictor.model
+        # Web調査準拠: SAM2ImagePredictorの正規アクセス方法
+        sam2_model = self._get_sam2_model()
+        
+        if sam2_model is not None:
+            # SAM2内部コンポーネントの確認
             if hasattr(sam2_model, 'image_encoder'):
-                # 🔇 冗長ログミュート: SAM2 Image Encoder構造の詳細を簡潔化
                 print("🔍 SAM2 Image Encoder: デバイス統一済み")
             
             if hasattr(sam2_model, 'sam_mask_decoder'):
-                # 🔇 冗長ログミュート: SAM2 Mask Decoder構造の詳細を簡潔化  
                 print("🔍 SAM2 Mask Decoder: デバイス統一済み")
+            elif hasattr(sam2_model, 'mask_decoder'):
+                print("🔍 SAM2 Mask Decoder: デバイス統一済み")
+                
+            print("✅ SAM2モデル正常アクセス完了")
         else:
-            print("⚠️ SAM2 predictor.modelにアクセスできません")
+            print("❌ SAM2モデルアクセス失敗: 設定を確認してください")
+    
+    def _get_sam2_model(self):
+        """Web調査準拠: SAM2ImagePredictorからモデルを取得する正規方法"""
+        
+        # 1. マルチスケールセグメンテーションヘッド経由
+        if hasattr(self.segmentation_head, 'predictor'):
+            predictor = self.segmentation_head.predictor
+            
+            # Web調査結果: SAM2ImagePredictorの複数アクセス方法をチェック
+            # Method 1: predictor.model（一般的）
+            if hasattr(predictor, 'model'):
+                return predictor.model
+            
+            # Method 2: predictor._model（内部属性）
+            if hasattr(predictor, '_model'):
+                return predictor._model
+                
+            # Method 3: predictor itself（predictorがモデルを内包）
+            if hasattr(predictor, 'image_encoder') and hasattr(predictor, 'mask_decoder'):
+                return predictor
+        
+        # 2. sam_wrapper経由のフォールバック
+        if hasattr(self.segmentation_head, 'sam_wrapper'):
+            sam_wrapper = self.segmentation_head.sam_wrapper
+            if hasattr(sam_wrapper, 'predictor'):
+                predictor = sam_wrapper.predictor
+                
+                # 同様のアクセス方法をチェック
+                if hasattr(predictor, 'model'):
+                    return predictor.model
+                if hasattr(predictor, '_model'):
+                    return predictor._model
+                if hasattr(predictor, 'image_encoder') and hasattr(predictor, 'mask_decoder'):
+                    return predictor
+        
+        return None
 
     def _ensure_input_device_consistency(self, *tensors, target_device):
         """入力テンソルのデバイス統一（修正方針Q: 勾配チェーン完全保持）"""
@@ -1729,6 +1758,11 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
                     batch_size, num_masks, h, w = masks.shape
                     masks_reshaped = masks.view(batch_size * num_masks, 1, h, w)
                     
+                    # Web調査準拠: dtype確認・統一（AuxiliaryDecoderはbfloat16で初期化済み）
+                    if masks_reshaped.dtype != torch.bfloat16:
+                        print(f"  🔧 dtype統一: {masks_reshaped.dtype} -> torch.bfloat16")
+                        masks_reshaped = masks_reshaped.to(dtype=torch.bfloat16)
+                    
                     # AuxiliaryDecoderで学習可能アップサンプリング実行
                     try:
                         # Web調査準拠: DeepLabV3スタイルの補助出力による学習可能アップサンプリング
@@ -1738,27 +1772,18 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
                         # 元の形状に復元: (B*3, 1, 1024, 1024) -> (B, 3, 1024, 1024)
                         masks = masks_upsampled.view(batch_size, num_masks, 1024, 1024)
                         print(f"  ✅ AuxiliaryDecoder成功: {masks.shape}")
+                        print(f"  - 変換後: {masks.shape}")
+                        print(f"  - 変換後勾配状況: requires_grad={masks.requires_grad}, grad_fn={masks.grad_fn}")
+                        print(f"✅ 解像度統一完了: torch.Size([{h}, {w}]) → torch.Size([1024, 1024])")
                         
                     except Exception as aux_error:
-                        print(f"  ⚠️ AuxiliaryDecoder失敗: {aux_error}")
-                        print(f"    - 入力形状: {masks_reshaped.shape}")
-                        print(f"    - AuxiliaryDecoder期待形状: 256x256 -> 1024x1024")
-                        print(f"  🔄 フォールバック: 改良F.interpolate使用")
-                        
-                        # フォールバック: 改良されたF.interpolate（float32変換版）
-                        original_dtype = masks.dtype
-                        masks_f32 = masks.to(torch.float32)  # 勾配保持型変換
-                        masks_reshaped = masks_f32.view(batch_size * num_masks, 1, h, w)
-                        
-                        masks_upsampled = F.interpolate(
-                            masks_reshaped,
-                            size=(1024, 1024),
-                            mode='bilinear',
-                            align_corners=False
+                        error_msg = (
+                            f"AuxiliaryDecoder処理に失敗しました: {aux_error}\n"
+                            f"入力形状: {masks_reshaped.shape}\n"
+                            f"期待形状: 256x256 -> 1024x1024\n"
+                            f"AuxiliaryDecoderの設定を確認し、適切な学習可能アップサンプリング層の実装を行ってください。"
                         )
-                        
-                        masks = masks_upsampled.view(batch_size, num_masks, 1024, 1024)
-                        masks = masks.to(dtype=original_dtype)  # 勾配保持型復元
+                        raise RuntimeError(error_msg)
                 else:
                     # デバッグ: AuxiliaryDecoder検出失敗の詳細分析
                     print(f"  🔍 AuxiliaryDecoder検出詳細:")
@@ -1777,30 +1802,14 @@ class EnhancedQFormerSegmentationBridge(nn.Module):
                             if hasattr(aux_decoder, 'upsampling_layers'):
                                 print(f"    - upsampling_layers type: {type(aux_decoder.upsampling_layers)}")
                     
-                    print(f"  ⚠️ AuxiliaryDecoder未検出")
-                    print(f"  🔄 改良F.interpolate使用")
-                    
-                    # 改良されたF.interpolate実装
-                    batch_size, num_masks, h, w = masks.shape
-                    original_dtype = masks.dtype
-                    
-                    # データ型統一で勾配安定化
-                    masks_f32 = masks.to(torch.float32)
-                    masks_reshaped = masks_f32.view(batch_size * num_masks, 1, h, w)
-                    
-                    masks_upsampled = F.interpolate(
-                        masks_reshaped,
-                        size=(1024, 1024),
-                        mode='bilinear',
-                        align_corners=False
+                    # AuxiliaryDecoder未検出エラー
+                    error_msg = (
+                        f"AuxiliaryDecoderが正しく初期化されていません。\n"
+                        f"MultiScaleSegmentationHeadのEnhancedMaskDecoder内にaux_decoderとupsampling_layersが必要です。\n"
+                        f"segmentation_head.enhanced_decoder.aux_decoder.upsampling_layersが見つかりません。\n"
+                        f"multiscale_decoder.pyでAuxiliaryDecoderの実装を確認してください。"
                     )
-                    
-                    masks = masks_upsampled.view(batch_size, num_masks, 1024, 1024)
-                    masks = masks.to(dtype=original_dtype)
-                
-                print(f"  - 変換後: {masks.shape}")
-                print(f"  - 変換後勾配状況: requires_grad={masks.requires_grad}, grad_fn={masks.grad_fn}")
-                print(f"✅ 解像度統一完了: torch.Size([{h}, {w}]) → torch.Size([1024, 1024])")
+                    raise RuntimeError(error_msg)
                 
             
             # 🔧 修正方針R: デバイス統一（SAM2出力を主要デバイスに強制転送）

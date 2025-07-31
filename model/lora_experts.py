@@ -14,6 +14,12 @@ import torch.nn.functional as F
 from typing import Optional, Dict, List, Tuple, Any, Union
 import math
 from collections import OrderedDict
+import sys
+import os
+
+# プロジェクトルートをパスに追加
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config_linux
 
 # グローバルフラグ（初回ログ制御用）
 _LORA_DEBUG_LOGGED = False
@@ -31,8 +37,8 @@ class LoRALayer(nn.Module):
         in_features: int,
         out_features: int,
         rank: int = 16,
-        alpha: float = 32.0,  # config_linux.LORA_ALPHA統一
-        dropout: float = 0.1,  # config_linux.LORA_DROPOUT統一
+        alpha: float = config_linux.LORA_ALPHA,
+        dropout: float = config_linux.LORA_DROPOUT,
         merge_weights: bool = False
     ):
         super().__init__()
@@ -115,8 +121,8 @@ class LoRALinear(nn.Linear):
         in_features: int,
         out_features: int,
         rank: int = 16,
-        alpha: float = 32.0,  # config_linux.LORA_ALPHA統一
-        dropout: float = 0.1,  # config_linux.LORA_DROPOUT統一
+        alpha: float = config_linux.LORA_ALPHA,
+        dropout: float = config_linux.LORA_DROPOUT,
         fan_in_fan_out: bool = False,
         merge_weights: bool = False,
         **kwargs
@@ -198,7 +204,7 @@ class MultiModalityRouter(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        num_experts: int = 4,
+        num_experts: int = config_linux.MOE_NUM_EXPERTS,
         hidden_dim: int = 256,
         temperature: float = 1.0,
         top_k: int = 2
@@ -208,7 +214,7 @@ class MultiModalityRouter(nn.Module):
         self.input_dim = input_dim
         self.num_experts = num_experts
         self.temperature = temperature
-        self.top_k = min(top_k, num_experts)
+        self.top_k = min(top_k or config_linux.MOE_TOP_K, num_experts)
         
         # モダリティ判定ネットワーク
         self.router = nn.Sequential(
@@ -298,10 +304,10 @@ class LoRAExpertMoE(nn.Module):
     def __init__(
         self,
         base_layer: nn.Module,
-        num_experts: int = 4,
+        num_experts: int = config_linux.MOE_NUM_EXPERTS,
         rank: int = 16,
-        alpha: float = 32.0,  # config_linux.LORA_ALPHA統一
-        dropout: float = 0.1,  # config_linux.LORA_DROPOUT統一
+        alpha: float = config_linux.LORA_ALPHA,
+        dropout: float = config_linux.LORA_DROPOUT,
         router_config: Optional[Dict[str, Any]] = None
     ):
         super().__init__()
@@ -534,10 +540,10 @@ def inject_lora_to_model(
     model: nn.Module,
     target_modules: List[str],
     rank: int = 16,
-    alpha: float = 32.0,  # config_linux.LORA_ALPHA統一
-    dropout: float = 0.1,  # config_linux.LORA_DROPOUT統一
+    alpha: float = config_linux.LORA_ALPHA,
+    dropout: float = config_linux.LORA_DROPOUT,
     use_moe: bool = False,
-    num_experts: int = 4,
+    num_experts: int = config_linux.MOE_NUM_EXPERTS,
     router_config: Optional[Dict[str, Any]] = None
 ) -> nn.Module:
     """

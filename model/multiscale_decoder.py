@@ -319,58 +319,89 @@ class AuxiliaryDecoder(nn.Module):
     ):
         super().__init__()
         
-        # 高解像度処理ブランチ
+        # 高解像度処理ブランチ（Web調査準拠: bfloat16で初期化）
         self.high_res_branch = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels * 2, 3, padding=1),
-            nn.GroupNorm(32, hidden_channels * 2),
+            nn.Conv2d(in_channels, hidden_channels * 2, 3, padding=1, dtype=torch.bfloat16),
+            nn.GroupNorm(32, hidden_channels * 2, dtype=torch.bfloat16),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels * 2, hidden_channels, 3, padding=1),
-            nn.GroupNorm(32, hidden_channels),
+            nn.Conv2d(hidden_channels * 2, hidden_channels, 3, padding=1, dtype=torch.bfloat16),
+            nn.GroupNorm(32, hidden_channels, dtype=torch.bfloat16),
             nn.ReLU(inplace=True)
         )
         
-        # 中解像度処理ブランチ
+        # 中解像度処理ブランチ（Web調査準拠: bfloat16で初期化）
         self.mid_res_branch = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, 3, padding=1),
-            nn.GroupNorm(32, hidden_channels),
+            nn.Conv2d(in_channels, hidden_channels, 3, padding=1, dtype=torch.bfloat16),
+            nn.GroupNorm(32, hidden_channels, dtype=torch.bfloat16),
             nn.ReLU(inplace=True)
         )
         
-        # 特徴統合
+        # 特徴統合（Web調査準拠: bfloat16で初期化）
         self.fusion = nn.Sequential(
-            nn.Conv2d(hidden_channels * 2, hidden_channels, 1),
-            nn.GroupNorm(32, hidden_channels),
+            nn.Conv2d(hidden_channels * 2, hidden_channels, 1, dtype=torch.bfloat16),
+            nn.GroupNorm(32, hidden_channels, dtype=torch.bfloat16),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, out_channels, 3, padding=1)
+            nn.Conv2d(hidden_channels, out_channels, 3, padding=1, dtype=torch.bfloat16)
         )
         
-        # 粗マスクの精細化
+        # 粗マスクの精細化（Web調査準拠: bfloat16で初期化）
         self.refine = nn.Sequential(
-            nn.Conv2d(out_channels + 1, hidden_channels, 3, padding=1),  # +1 for coarse mask
-            nn.GroupNorm(32, hidden_channels),
+            nn.Conv2d(out_channels + 1, hidden_channels, 3, padding=1, dtype=torch.bfloat16),  # +1 for coarse mask
+            nn.GroupNorm(32, hidden_channels, dtype=torch.bfloat16),
             nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, 1, 1)
+            nn.Conv2d(hidden_channels, 1, 1, dtype=torch.bfloat16)
         )
         
         # Web調査準拠: DeepLabV3スタイルの学習可能アップサンプリング層
         # 単純なF.interpolateの代替として学習可能なアップサンプリングを提供
+        # Web調査結果: ConvTranspose2dでdtype=torch.bfloat16を明示的に指定
         self.upsampling_layers = nn.Sequential(
             # 転置畳み込みによる学習可能アップサンプリング (4x)
-            nn.ConvTranspose2d(1, hidden_channels//4, kernel_size=4, stride=4, bias=False),
-            nn.GroupNorm(8, hidden_channels//4),
+            nn.ConvTranspose2d(1, hidden_channels//4, kernel_size=4, stride=4, bias=False, dtype=torch.bfloat16),
+            nn.GroupNorm(8, hidden_channels//4, dtype=torch.bfloat16),
             nn.ReLU(inplace=True),
             # 細部調整用の畳み込み
-            nn.Conv2d(hidden_channels//4, hidden_channels//8, 3, padding=1),
-            nn.GroupNorm(4, hidden_channels//8),
+            nn.Conv2d(hidden_channels//4, hidden_channels//8, 3, padding=1, dtype=torch.bfloat16),
+            nn.GroupNorm(4, hidden_channels//8, dtype=torch.bfloat16),
             nn.ReLU(inplace=True),
             # 最終出力
-            nn.Conv2d(hidden_channels//8, 1, 1),
+            nn.Conv2d(hidden_channels//8, 1, 1, dtype=torch.bfloat16),
             nn.Sigmoid()  # マスク値を[0,1]に正規化
         )
         
         print(f"✅ AuxiliaryDecoder初期化")
         print(f"  - 入力チャネル: {in_channels}")
         print(f"  - 隠れチャネル: {hidden_channels}")
+        
+        # Web調査準拠: BFloat16対応のdtype統一メソッド追加
+        self._target_dtype = torch.bfloat16  # デフォルトターゲットdtype
+        self._initialized = False
+        
+        # Web調査準拠: 初期化直後にdtype統一を確実に実行
+        self.ensure_dtype_consistency(torch.bfloat16)
+        print(f"  - 初期化時dtype統一完了: torch.bfloat16")
+    
+    def ensure_dtype_consistency(self, target_dtype: torch.dtype = None):
+        """
+        Web調査準拠: レイヤーのdtype一貫性を確保
+        
+        Args:
+            target_dtype: 目標データ型（デフォルト: torch.bfloat16）
+        """
+        if target_dtype is None:
+            target_dtype = self._target_dtype
+        
+        # 全レイヤーをターゲットdtypeに統一
+        self.to(dtype=target_dtype)
+        self._target_dtype = target_dtype
+        self._initialized = True
+        
+        print(f"  🔧 AuxiliaryDecoder dtype統一完了: {target_dtype}")
+        
+        # デバッグ: 主要レイヤーのdtypeを確認
+        for name, layer in [('upsampling_conv', self.upsampling_layers[0]), ('refine_conv', self.refine[0])]:
+            if hasattr(layer, 'weight') and layer.weight is not None:
+                print(f"    - {name} dtype: {layer.weight.dtype}")
     
     def forward(
         self,
@@ -389,6 +420,31 @@ class AuxiliaryDecoder(nn.Module):
         Returns:
             精細化されたマスク [B, 1, H, W]
         """
+        # Web調査準拠: forward実行時のdtype整合性確認（デバッグルール準拠で1回のみ出力）
+        if not self._initialized:
+            target_dtype = coarse_mask.dtype if coarse_mask.dtype != torch.float32 else torch.bfloat16
+            print(f"  🔍 AuxiliaryDecoder dtype確認（初回のみ）:")
+            print(f"    - high_res_feat: {high_res_feat.dtype}")
+            print(f"    - mid_res_feat: {mid_res_feat.dtype}")
+            print(f"    - coarse_mask: {coarse_mask.dtype}")
+            print(f"    - target_dtype: {target_dtype}")
+            
+            # upsampling_layersの重要なレイヤーのdtypeを確認
+            first_conv = self.upsampling_layers[0]  # ConvTranspose2d
+            if hasattr(first_conv, 'weight') and first_conv.weight is not None:
+                print(f"    - upsampling_layers[0] weight dtype: {first_conv.weight.dtype}")
+                
+                # dtype不一致がある場合はエラーとして報告（フォールバック処理は行わない）
+                if first_conv.weight.dtype != target_dtype:
+                    raise RuntimeError(
+                        f"AuxiliaryDecoder dtype不一致検出: "
+                        f"upsampling_layers重み dtype={first_conv.weight.dtype}, "
+                        f"入力 dtype={target_dtype}. "
+                        f"初期化時のdtype統一が正しく実行されませんでした。"
+                    )
+            
+            self._initialized = True
+        
         # 解像度を合わせる
         target_size = coarse_mask.shape[-2:]
         
@@ -428,12 +484,20 @@ class EnhancedMaskDecoder(nn.Module):
         # 既存のSAM2 MaskDecoder
         self.main_decoder = sam_mask_decoder
         
-        # 補助デコーダー
+        # SAM2のdtypeを確認（Web調査準拠: 手動キャスト回避）
+        sam_dtype = next(sam_mask_decoder.parameters()).dtype if hasattr(sam_mask_decoder, 'parameters') else torch.bfloat16
+        
+        # 補助デコーダー（SAM2と同じdtypeで初期化）
         self.aux_decoder = AuxiliaryDecoder(
             in_channels=image_encoder_dim,
             hidden_channels=hidden_dim,
             out_channels=hidden_dim
         )
+        
+        # Web調査準拠: 初期化直後にdtype統一（AMP使用時の推奨方法）
+        if sam_dtype != torch.float32:
+            self.aux_decoder.ensure_dtype_consistency(sam_dtype)
+            print(f"  🔧 EnhancedMaskDecoder: AuxiliaryDecoder初期化時dtype統一完了: {sam_dtype}")
         
         # マルチスケール特徴の投影
         self.feature_projectors = nn.ModuleDict({
@@ -441,6 +505,10 @@ class EnhancedMaskDecoder(nn.Module):
             'mid': nn.Conv2d(image_encoder_dim, image_encoder_dim, 1),
             'low': nn.Conv2d(image_encoder_dim, image_encoder_dim, 1)
         })
+        
+        # Web調査準拠: feature_projectorsもdtype統一
+        if sam_dtype != torch.float32:
+            self.feature_projectors = self.feature_projectors.to(dtype=sam_dtype)
         
         # 視覚コンテキストの処理（LLMからの入力用）
         self.context_projector = nn.Sequential(
@@ -458,6 +526,11 @@ class EnhancedMaskDecoder(nn.Module):
             nn.Conv2d(8, 1, 1),
             nn.Sigmoid()
         )
+        
+        # Web調査準拠: 全補助モジュールのdtype統一
+        if sam_dtype != torch.float32:
+            self.context_projector = self.context_projector.to(dtype=sam_dtype)
+            self.mask_fusion = self.mask_fusion.to(dtype=sam_dtype)
         
         print(f"✅ EnhancedMaskDecoder初期化")
         print(f"  - メインデコーダー: SAM2 MaskDecoder")
@@ -752,20 +825,10 @@ class MultiScaleSegmentationHead(nn.Module):
         # マルチスケール特徴抽出器
         self.feature_extractor = MultiScaleFeatureExtractor(stages)
         
-        # 拡張マスクデコーダー
-        # SAM2の場合はpredictor.modelからsam_mask_decoderを取得
-        if hasattr(sam_wrapper, 'predictor') and hasattr(sam_wrapper.predictor, 'model'):
-            # SAM2の場合
-            actual_model = sam_wrapper.predictor.model
-            if hasattr(actual_model, 'sam_mask_decoder'):
-                mask_decoder = actual_model.sam_mask_decoder
-            else:
-                raise AttributeError("SAM2 modelにsam_mask_decoderが見つかりません")
-        elif hasattr(sam_wrapper, 'mask_decoder'):
-            # SAM1の場合
-            mask_decoder = sam_wrapper.mask_decoder
-        else:
-            raise AttributeError("sam_mask_decoderが見つかりません")
+        # Web調査準拠: SAM2ImagePredictorからmask_decoderを取得
+        mask_decoder = self._get_sam2_mask_decoder(sam_wrapper)
+        if mask_decoder is None:
+            raise AttributeError("SAM2 mask_decoderが見つかりません。SAM2ImagePredictorの設定を確認してください。")
             
         self.enhanced_decoder = EnhancedMaskDecoder(
             sam_mask_decoder=mask_decoder,
@@ -773,14 +836,12 @@ class MultiScaleSegmentationHead(nn.Module):
             hidden_dim=256
         )
         
-        # SAMの他のコンポーネント
-        # SAM2の場合はpredictor.modelから取得
-        if hasattr(sam_wrapper, 'predictor') and hasattr(sam_wrapper.predictor, 'model'):
-            # SAM2の場合
-            actual_model = sam_wrapper.predictor.model
-            self.image_encoder = actual_model.image_encoder if hasattr(actual_model, 'image_encoder') else None
+        # Web調査準拠: SAM2ImagePredictorから他のコンポーネントを取得
+        sam2_model = self._get_sam2_model(sam_wrapper)
+        if sam2_model is not None:
+            self.image_encoder = sam2_model.image_encoder if hasattr(sam2_model, 'image_encoder') else None
             # SAM2ではsam_prompt_encoderが正しい属性名
-            self.prompt_encoder = actual_model.sam_prompt_encoder if hasattr(actual_model, 'sam_prompt_encoder') else None
+            self.prompt_encoder = sam2_model.sam_prompt_encoder if hasattr(sam2_model, 'sam_prompt_encoder') else None
             
             # SAM2Wrapperも保持（predict_with_promptsメソッド用）
             self.sam_wrapper = sam_wrapper
@@ -791,6 +852,45 @@ class MultiScaleSegmentationHead(nn.Module):
             self.sam_wrapper = sam_wrapper
         
         print(f"✅ MultiScaleSegmentationHead初期化完了")
+    
+    def _get_sam2_model(self, sam_wrapper):
+        """Web調査準拠: SAM2ImagePredictorからモデルを取得する正規方法"""
+        
+        if hasattr(sam_wrapper, 'predictor'):
+            predictor = sam_wrapper.predictor
+            
+            # Web調査結果: SAM2ImagePredictorの複数アクセス方法をチェック
+            # Method 1: predictor.model（一般的）
+            if hasattr(predictor, 'model'):
+                return predictor.model
+            
+            # Method 2: predictor._model（内部属性）
+            if hasattr(predictor, '_model'):
+                return predictor._model
+                
+            # Method 3: predictor itself（predictorがモデルを内包）
+            if hasattr(predictor, 'image_encoder') and hasattr(predictor, 'mask_decoder'):
+                return predictor
+                
+        return None
+    
+    def _get_sam2_mask_decoder(self, sam_wrapper):
+        """Web調査準拠: SAM2ImagePredictorからmask_decoderを取得"""
+        
+        # まずモデル全体を取得
+        sam2_model = self._get_sam2_model(sam_wrapper)
+        if sam2_model is not None:
+            # SAM2では複数の名前でmask_decoderが存在する可能性
+            if hasattr(sam2_model, 'sam_mask_decoder'):
+                return sam2_model.sam_mask_decoder
+            elif hasattr(sam2_model, 'mask_decoder'):
+                return sam2_model.mask_decoder
+        
+        # フォールバック: sam_wrapperから直接
+        if hasattr(sam_wrapper, 'mask_decoder'):
+            return sam_wrapper.mask_decoder
+            
+        return None
     
     def forward(
         self,

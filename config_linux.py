@@ -109,6 +109,11 @@ LORA_R = 16                            # 🔄 SAM2+MLE論文準拠（64→16）�
 LORA_ALPHA = 32                        # 🔄 SAM2+MLE論文準拠（128→32）2 * r
 LORA_DROPOUT = 0.1                     # 🔄 SAM2+MLE論文準拠（0.05→0.1）
 
+# MoE設定（実装仕様書準拠: phase3b_implementation_spec_20250727.md）
+MOE_NUM_EXPERTS = 2                    # RGB, Depth（将来拡張用）
+MOE_TOP_K = 2                          # Top-k expert selection
+MOE_EXPERT_CAPACITY_FACTOR = 1.25      # 負荷分散
+
 # ターゲットモジュール（SAM2+MLE論文準拠）
 LORA_TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",  # Attention層（必須）
@@ -435,10 +440,10 @@ def get_mle_config() -> Dict[str, Any]:
         'lora_alpha': LORA_ALPHA,               # 32 (論文推奨)
         'lora_dropout': LORA_DROPOUT,           # 0.1 (論文推奨)
         
-        # MoE設定 (論文準拠)
-        'moe_top_k': 2,                         # Top-2 expert selection
-        'expert_capacity_factor': 1.25,         # 負荷分散
-        'num_experts': 3,                       # Llama, SAM2, Q-Former
+        # MoE設定 (統一設定参照)
+        'moe_top_k': MOE_TOP_K,                 # Top-k expert selection
+        'expert_capacity_factor': MOE_EXPERT_CAPACITY_FACTOR,  # 負荷分散
+        'num_experts': MOE_NUM_EXPERTS,         # エキスパート数
         
         # モーダル特化target_modules
         'target_modules': {
@@ -447,11 +452,10 @@ def get_mle_config() -> Dict[str, Any]:
             'qformer': QFORMER_TARGET_MODULES   # Q-Former特化
         },
         
-        # エキスパート重み (論文準拠)
+        # エキスパート重み (実装仕様書準拠: 2エキスパート構成)
         'expert_weights': {
-            'llama': 0.4,                       # 言語理解・推論
-            'sam2': 0.4,                        # 視覚セグメンテーション
-            'qformer': 0.2                      # クロスモーダル融合
+            'rgb': 0.5,                         # RGB画像処理専門
+            'depth': 0.5                        # Depth情報処理専門（将来拡張用）
         },
         
         # 期待効果 (論文実証値)
