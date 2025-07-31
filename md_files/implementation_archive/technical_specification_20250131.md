@@ -1,7 +1,8 @@
 # SAM2.1 + Qwen2.5-VL統合モデル技術仕様書
 
 **作成日**: 2025年1月31日  
-**仕様バージョン**: 1.0  
+**最終更新**: 2025年1月31日（環境適応修正反映）  
+**仕様バージョン**: 1.1  
 **対象読者**: 開発者、研究者、保守担当者  
 
 ## 📋 技術仕様概要
@@ -124,6 +125,10 @@ def _detect_environment():
     # Windows Detection
     if system == "windows":
         return "windows", None
+    
+    # WSL2 Detection (Linux with Windows mount paths)
+    if os.path.exists("/mnt/h/download/LISA-dataset/dataset"):
+        return "wsl2", None
         
     return "linux", None
 ```
@@ -139,6 +144,11 @@ PATH_RESOLUTION_STRATEGY = {
     "windows": {
         "dataset": r"H:\download\LISA-dataset\data\dataset", 
         "checkpoints": r"H:\download\weights",
+        "logs": "./logs"
+    },
+    "wsl2": {
+        "dataset": "/mnt/h/download/LISA-dataset/dataset",
+        "checkpoints": "/mnt/h/download/weights",
         "logs": "./logs"
     },
     "linux": {
