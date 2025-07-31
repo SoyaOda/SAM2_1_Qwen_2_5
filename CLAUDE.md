@@ -21,6 +21,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 上記の方針で実装を進めてきた。現状のコードを理解して、test_sam_qwen_integration.pyが走るように追加実装・修正してほしい。
 
 ※実装の際に注意すること
+・自信のない部分は適宜正規（Qwen, SAM, Qformer, Huggingface, Pytorchなど公式の実装）の実装をWebでしらべながら予想や自前の実装を少なくして実装すること
 ・o3_spec.mdはあくまでおおまかな指針であるので、細かな実装はWebでベストプラクティスをリサーチして[Introduction]に述べている目的に沿うように、本質的に実装を進めること（簡易な実装でとりあえず走るコードは必要ない、本質的に目標を達成するコードが欲しい）
 ・Webリサーチを積極的に行い、Qwen, SAMの正規の実装をできるだけ用いること
 ・フォールバック的もしくはダミーコードはエラーを隠蔽するので適切にエラーを出して止め、次のデバッグに繋がる情報を提供するように修正すること

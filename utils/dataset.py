@@ -1,7 +1,7 @@
 # utils/dataset.py
 """
-LISA-Llama4 デュアルストリーム・データパイプライン
-仕様書第3章に従った実装
+SAM2.1 + Qwen2.5-VL統合モデル用データセットパイプライン
+o3_spec2.md仕様に基づく<SEG>特殊トークン対応
 """
 
 import glob
@@ -29,16 +29,24 @@ from .sem_seg_dataset import SemSegDataset
 from .vqa_dataset import VQADataset
 from .transforms import ResizeLongestSide
 
-# 🔧 修正方針M: config重複読み込み防止（キャッシュ機能追加）
+# 🔧 統一設定ファイルの読み込み（config_unified.py対応）
 _cached_config = None
 
 def get_config():
-    """実行時の設定ファイルを動的に取得（キャッシュ機能付き）"""
+    """実行時の設定ファイルを動的に取得（統一設定優先）"""
     global _cached_config
     if _cached_config is not None:
         return _cached_config
     
     try:
+        # 統一設定ファイルを最優先で使用
+        if os.path.exists('config_unified.py'):
+            import config_unified as config
+            print("✅ 設定: config_unified.py を使用（SAM2.1+Qwen2.5-VL統合設定）")
+            _cached_config = config
+            return config
+        
+        # フォールバック: 既存設定ファイル
         config_path = os.environ.get('LISA_CONFIG_PATH', 'config_linux')
         if os.path.exists('config_small_test.py'):
             import config_small_test as config
@@ -58,33 +66,51 @@ def get_config():
             return config
     except ImportError as e:
         print(f"設定ファイルのインポートに失敗: {e}")
-    print("警告: 設定ファイルが見つかりません。デフォルト設定を使用します。")
+    
+    print("⚠️ 警告: 設定ファイルが見つかりません。デフォルト設定を使用します。")
     class DefaultConfig:
-        MODEL_MAX_LENGTH = 2048
-        LLAMA_IMAGE_SIZE = 448
-        SAM_IMAGE_SIZE = 1024
-        SEG_TOKEN = "[SEG]"
+        MODEL_MAX_LENGTH = 8192  # Qwen2.5-VL用に拡張
+        QWEN_IMAGE_SIZE = 448    # Qwen2.5-VL画像サイズ
+        SAM_IMAGE_SIZE = 1024    # SAM2.1画像サイズ
+        SEG_TOKEN = "<SEG>"      # o3_spec2.md準拠
+        IMAGE_TOKEN = "<image>"
         DATASET_BASE_DIR = "./dataset"
+        SAMPLES_PER_EPOCH = 500
+        # データセット設定
+        SEM_SEG_DATA = "ade20k||cocostuff"
+        REFER_SEG_DATA = "refcoco||refcoco+||refcocog"
+        VQA_DATA = "llava_instruct_150k"
+        REASON_SEG_DATA = "ReasonSeg|train"
     _cached_config = DefaultConfig()
     return _cached_config
 
 config = get_config()
 
-# デフォルト設定
-DEFAULT_IMAGE_TOKEN = "<image>"
-DEFAULT_SEG_TOKEN = getattr(config, 'SEG_TOKEN', "[SEG]")
+# デフォルト設定（o3_spec2.md準拠）
+DEFAULT_IMAGE_TOKEN = getattr(config, 'IMAGE_TOKEN', "<image>")
+DEFAULT_SEG_TOKEN = getattr(config, 'SEG_TOKEN', "<SEG>")  # o3_spec2.md準拠で<SEG>
 IGNORE_INDEX = -100
 
-def setup_seg_token(tokenizer, seg_token="[SEG]"):
+def setup_seg_token(tokenizer, seg_token="<SEG>"):
     """
-    オリジナルLISA準拠の[SEG]トークンセットアップ
-    一元化された処理でフォールバックなし
+    o3_spec2.md準拠の<SEG>特殊トークンセットアップ
+    エンドツーエンドマスク生成に対応
     """
-    num_added_tokens = tokenizer.add_tokens(seg_token)
-    seg_token_idx = tokenizer(seg_token, add_special_tokens=False).input_ids[0]
-    print(f"[SEG]トークンセットアップ完了:")
+    # 既存の特殊トークンを確認
+    if seg_token in tokenizer.get_vocab():
+        seg_token_idx = tokenizer.convert_tokens_to_ids(seg_token)
+        print(f"✅ <SEG>トークンは既に存在: ID={seg_token_idx}")
+        return seg_token_idx
+    
+    # 新しい特殊トークンとして追加
+    num_added_tokens = tokenizer.add_special_tokens({'additional_special_tokens': [seg_token]})
+    seg_token_idx = tokenizer.convert_tokens_to_ids(seg_token)
+    
+    print(f"✅ <SEG>特殊トークンセットアップ完了:")
     print(f"  - 追加されたトークン数: {num_added_tokens}")
-    print(f"  - [SEG]トークンID: {seg_token_idx}")
+    print(f"  - <SEG>トークンID: {seg_token_idx}")
+    print(f"  - 総語彙サイズ: {len(tokenizer)}")
+    
     return seg_token_idx
 
 def setup_image_token(tokenizer, image_token="<image>"):
@@ -231,18 +257,23 @@ def preprocess_mask(mask: np.ndarray, original_size: Tuple[int, int] = None) -> 
 
 class HybridDataset(torch.utils.data.Dataset):
     """
-    仕様書第3章.2 HybridDatasetの実装
-    デュアルストリーム処理：Llama4用とSAM用の2系統前処理を同時実行
+    SAM2.1 + Qwen2.5-VL統合モデル用ハイブリッドデータセット
+    
+    o3_spec2.md仕様に基づく統合実装:
+    - SAM2.1用画像前処理（1024x1024）
+    - Qwen2.5-VL用マルチモーダル前処理
+    - <SEG>特殊トークンによるエンドツーエンドマスク生成対応
+    - 複数データセット統合（sem_seg, refer_seg, vqa, reason_seg）
     """
 
     def __init__(
         self,
         base_image_dir: Optional[str] = None,
-        llama_processor: Optional[AutoProcessor] = None,
-        samples_per_epoch: int = 500 * 8 * 2 * 10,
+        qwen_processor: Optional[AutoProcessor] = None,  # Qwen2.5-VL用プロセッサ
+        samples_per_epoch: int = 500,  # デフォルト値を現実的に
         precision: str = "bf16",
-        llama_image_size: Optional[int] = None,
-        sam_image_size: Optional[int] = None,
+        qwen_image_size: Optional[int] = None,      # Qwen2.5-VL画像サイズ
+        sam_image_size: Optional[int] = None,       # SAM2.1画像サイズ
         num_classes_per_sample: int = 3,
         exclude_val: bool = False,
         dataset: str = "sem_seg||refer_seg||vqa||reason_seg",
@@ -254,10 +285,10 @@ class HybridDataset(torch.utils.data.Dataset):
         explanatory: float = 0.1,
     ):
         self.base_image_dir = base_image_dir or getattr(config, 'DATASET_BASE_DIR', './dataset')
-        self.llama_processor = llama_processor
+        self.qwen_processor = qwen_processor  # Qwen2.5-VL用プロセッサ
         self.samples_per_epoch = samples_per_epoch
         self.precision = precision
-        self.llama_image_size = llama_image_size or getattr(config, 'LLAMA_IMAGE_SIZE', 448)
+        self.qwen_image_size = qwen_image_size or getattr(config, 'QWEN_IMAGE_SIZE', 448)
         self.sam_image_size = sam_image_size or getattr(config, 'SAM_IMAGE_SIZE', 1024)
         self.num_classes_per_sample = num_classes_per_sample
         self.exclude_val = exclude_val
@@ -271,24 +302,26 @@ class HybridDataset(torch.utils.data.Dataset):
         sample_rate = np.array(sample_rate)
         self.sample_rate = sample_rate / sample_rate.sum()
 
-        if self.llama_processor and self.llama_processor.tokenizer:
-            self.seg_token = getattr(config, 'SEG_TOKEN', '[SEG]')
-            self.seg_token_idx = setup_seg_token(self.llama_processor.tokenizer, self.seg_token)
-            # デュアルエンコーダー構成: <image>トークンをセットアップ
+        if self.qwen_processor and self.qwen_processor.tokenizer:
+            # o3_spec2.md準拠の<SEG>特殊トークンセットアップ
+            self.seg_token = getattr(config, 'SEG_TOKEN', '<SEG>')
+            self.seg_token_idx = setup_seg_token(self.qwen_processor.tokenizer, self.seg_token)
+            # Qwen2.5-VL用<image>トークンセットアップ
             self.image_token = DEFAULT_IMAGE_TOKEN
-            self.image_token_idx = setup_image_token(self.llama_processor.tokenizer, self.image_token)
-            self.max_length = getattr(config, 'MODEL_MAX_LENGTH', 2048)
+            self.image_token_idx = setup_image_token(self.qwen_processor.tokenizer, self.image_token)
+            self.max_length = getattr(config, 'MODEL_MAX_LENGTH', 8192)  # Qwen2.5-VL用に拡張
         else:
-            raise ValueError("llama_processor は必須です")
+            raise ValueError("qwen_processor は必須です（Qwen2.5-VL用プロセッサが必要）")
 
         self.datasets = dataset.split("||")
         self.all_datasets = []
         
-        print(f"HybridDataset初期化:")
+        print(f"✅ SAM2.1 + Qwen2.5-VL統合HybridDataset初期化:")
         print(f"  - ベースディレクトリ: {self.base_image_dir}")
-        print(f"  - Llama画像サイズ: {self.llama_image_size}")
-        print(f"  - SAM画像サイズ: {self.sam_image_size}")
+        print(f"  - Qwen2.5-VL画像サイズ: {self.qwen_image_size}")
+        print(f"  - SAM2.1画像サイズ: {self.sam_image_size}")
         print(f"  - 対象データセット: {self.datasets}")
+        print(f"  - <SEG>トークン: {self.seg_token} (ID: {self.seg_token_idx})")
         
         if "sem_seg" in self.datasets:
             print(f"  - Semantic Segmentation: {self.sem_seg_data}")
@@ -296,11 +329,11 @@ class HybridDataset(torch.utils.data.Dataset):
                 self.all_datasets.append(
                     SemSegDataset(
                         self.base_image_dir,
-                        self.llama_processor.tokenizer,
+                        self.qwen_processor.tokenizer,  # Qwen2.5-VL用トークナイザー
                         None,
                         samples_per_epoch,
                         precision,
-                        self.llama_image_size,
+                        self.qwen_image_size,  # Qwen2.5-VL画像サイズ
                         num_classes_per_sample,
                         exclude_val,
                         self.sem_seg_data,
@@ -315,11 +348,11 @@ class HybridDataset(torch.utils.data.Dataset):
                 self.all_datasets.append(
                     ReferSegDataset(
                         self.base_image_dir,
-                        self.llama_processor.tokenizer,
+                        self.qwen_processor.tokenizer,  # Qwen2.5-VL用トークナイザー
                         None,
                         samples_per_epoch,
                         precision,
-                        self.llama_image_size,
+                        self.qwen_image_size,  # Qwen2.5-VL画像サイズ
                         num_classes_per_sample,
                         exclude_val,
                         self.refer_seg_data,
@@ -334,11 +367,11 @@ class HybridDataset(torch.utils.data.Dataset):
                 self.all_datasets.append(
                     VQADataset(
                         self.base_image_dir,
-                        self.llama_processor.tokenizer,
+                        self.qwen_processor.tokenizer,  # Qwen2.5-VL用トークナイザー
                         None,
                         samples_per_epoch,
                         precision,
-                        self.llama_image_size,
+                        self.qwen_image_size,  # Qwen2.5-VL画像サイズ
                         exclude_val,
                         self.vqa_data,
                     )
@@ -352,11 +385,11 @@ class HybridDataset(torch.utils.data.Dataset):
                 self.all_datasets.append(
                     ReasonSegDataset(
                         base_image_dir=self.base_image_dir,
-                        tokenizer=self.llama_processor.tokenizer,
+                        tokenizer=self.qwen_processor.tokenizer,  # Qwen2.5-VL用トークナイザー
                         vision_tower=None,
                         samples_per_epoch=samples_per_epoch,
                         precision=precision,
-                        image_size=self.llama_image_size,
+                        image_size=self.qwen_image_size,  # Qwen2.5-VL画像サイズ
                         num_classes_per_sample=num_classes_per_sample,
                         exclude_val=exclude_val,
                         reason_seg_data=self.reason_seg_data,
