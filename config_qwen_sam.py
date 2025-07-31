@@ -12,7 +12,8 @@ class SAMQwenConfig:
     def __init__(self):
         # Model identifiers
         self.QWEN_MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
-        self.SAM_MODEL_ID = "facebook/sam2.1-hiera-large"
+        self.SAM_MODEL_ID = "sam2.1_hiera_large.pt"  # チェックポイントファイル名
+        self.SAM_CONFIG_ID = "sam2.1_hiera_l.yaml"   # 設定ファイル名
         
         # Model settings
         self.TORCH_DTYPE = torch.float16
@@ -83,6 +84,7 @@ class SAMQwenConfig:
         return {
             'model_name': self.QWEN_MODEL_ID,
             'sam_model_name': self.SAM_MODEL_ID,
+            'sam_config_name': self.SAM_CONFIG_ID,  # SAM2.1設定ファイル
             'use_qformer': self.USE_QFORMER,
             'num_queries': self.NUM_QUERIES,
             'torch_dtype': self.TORCH_DTYPE,

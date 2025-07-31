@@ -14,6 +14,8 @@ import warnings
 
 # プロジェクトルートをパスに追加
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# SAM2パスを追加
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sam2'))
 
 # 設定とモデルのインポート
 from config_qwen_sam import get_config, validate_config
@@ -92,9 +94,9 @@ def test_model_initialization():
         print("✅ モデル初期化成功！")
         print(f"  - デバイス: {model.device}")
         print(f"  - Qwenモデル: {model.model_name}")
-        print(f"  - SAMモデル: {model.sam_model_name}")
-        print(f"  - 視覚プロジェクター: {'Q-Former' if model.use_qformer else 'Linear'}")
-        print(f"  - クエリ数: {model.num_queries}")
+        print(f"  - SAMモデル: {model.sam_checkpoint}")
+        sam_status = "利用可能" if model.sam_predictor is not None else "利用不可（Qwenのみ）"
+        print(f"  - SAM2.1ステータス: {sam_status}")
         
         return model, config
         
@@ -106,38 +108,20 @@ def test_model_initialization():
 
 
 def test_visual_projector(model, config):
-    """視覚プロジェクターのテスト"""
-    print("\n🔍 視覚プロジェクターテスト...")
+    """視覚プロジェクターのテスト（新しい実装では不要）"""
+    print("\n🔍 視覚処理テスト...")
     
     try:
-        # テスト用の視覚特徴
-        batch_size = 1
-        num_patches = 64  # 8x8のパッチグリッド
-        image_dim = 256  # SAM2.1のデフォルト次元
-        
-        visual_features = torch.randn(batch_size, num_patches, image_dim).to(model.device)
-        
-        # プロジェクター実行
-        with torch.no_grad():
-            projected_features = model.visual_projector(visual_features)
-        
-        print("✅ 視覚プロジェクター動作確認")
-        print(f"  - 入力形状: {visual_features.shape}")
-        print(f"  - 出力形状: {projected_features.shape}")
-        print(f"  - 期待クエリ数: {model.num_queries}")
-        print(f"  - 期待次元: {model.llm.config.hidden_size}")
-        
-        # 形状確認
-        expected_shape = (batch_size, model.num_queries, model.llm.config.hidden_size)
-        if projected_features.shape == expected_shape:
-            print("✅ 出力形状正常")
-        else:
-            print(f"⚠️ 出力形状不一致: 期待 {expected_shape}, 実際 {projected_features.shape}")
+        # 新しい実装ではQwen2.5-VLが独自の視覚処理を持つ
+        print("✅ 視覚処理: Qwen2.5-VL内蔵プロセッサーを使用")
+        print(f"  - プロセッサー: {type(model.qwen_processor).__name__}")
+        print(f"  - モデル隠れ次元: {model.qwen_model.config.hidden_size}")
+        print(f"  - デバイス: {model.device}")
         
         return True
         
     except Exception as e:
-        print(f"❌ 視覚プロジェクターテスト失敗: {str(e)}")
+        print(f"❌ 視覚処理テスト失敗: {str(e)}")
         return False
 
 
