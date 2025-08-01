@@ -15,8 +15,13 @@ import os
 import sys
 import torch
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 import warnings
+import json
+import matplotlib.pyplot as plt
+import cv2
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
 
 # プロジェクトルートとsam2パスを追加
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -121,13 +126,93 @@ def test_seg_token_model():
         traceback.print_exc()
         return False, None
 
-def test_end_to_end_inference(model):
-    """エンドツーエンド推論のテスト"""
+def calculate_iou(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
+    """IoU (Intersection over Union) を計算"""
+    intersection = np.logical_and(pred_mask, gt_mask).sum()
+    union = np.logical_or(pred_mask, gt_mask).sum()
+    
+    if union == 0:
+        return 0.0
+    
+    return float(intersection) / float(union)
+
+
+def calculate_dice(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
+    """Dice係数 (F1スコア) を計算"""
+    intersection = np.logical_and(pred_mask, gt_mask).sum()
+    pred_sum = pred_mask.sum()
+    gt_sum = gt_mask.sum()
+    
+    if pred_sum + gt_sum == 0:
+        return 0.0
+    
+    return float(2 * intersection) / float(pred_sum + gt_sum)
+
+
+def visualize_mask(image: Image.Image, mask: np.ndarray, output_path: str, 
+                   title: str = "Segmentation Result", alpha: float = 0.5) -> None:
+    """マスクを画像に重ねて可視化し保存"""
+    # PIL Imageをnumpy配列に変換
+    img_array = np.array(image)
+    h, w = img_array.shape[:2]
+    
+    # マスクのリサイズ（必要な場合）
+    if mask.shape != (h, w):
+        mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+    
+    # マスクを3チャンネルに拡張
+    mask_colored = np.zeros_like(img_array)
+    mask_colored[:, :, 0] = mask * 255  # 赤色でマスク表示
+    
+    # 元画像とマスクを合成
+    result = cv2.addWeighted(img_array, 1-alpha, mask_colored, alpha, 0)
+    
+    # 可視化
+    plt.figure(figsize=(12, 4))
+    
+    plt.subplot(1, 3, 1)
+    plt.imshow(img_array)
+    plt.title("Original Image")
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 2)
+    plt.imshow(mask, cmap='gray')
+    plt.title("Predicted Mask")
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 3)
+    plt.imshow(result)
+    plt.title(title)
+    plt.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"📸 可視化結果を保存: {output_path}")
+
+
+def test_end_to_end_inference(model, save_results: bool = True):
+    """エンドツーエンド推論のテスト（改良版）"""
     print("\n🧪 Test 4: エンドツーエンドマスク生成推論")
     
     try:
-        # テスト用のダミー画像を作成
-        dummy_image = Image.new('RGB', (224, 224), color='red')
+        # より現実的なテスト画像を作成（赤い円を描画）
+        test_image = Image.new('RGB', (512, 512), color='white')
+        draw = ImageDraw.Draw(test_image)
+        # 赤い円を描画
+        draw.ellipse([150, 150, 350, 350], fill='red', outline='darkred', width=3)
+        # 青い四角を描画（負のテスト用）
+        draw.rectangle([50, 50, 120, 120], fill='blue', outline='darkblue', width=2)
+        
+        # テスト用のGround Truthマスク作成（評価指標計算用）
+        gt_mask = np.zeros((512, 512), dtype=bool)
+        # 円の部分をTrueに
+        center = (250, 250)
+        radius = 100
+        y, x = np.ogrid[:512, :512]
+        circle_mask = (x - center[0])**2 + (y - center[1])**2 <= radius**2
+        gt_mask[circle_mask] = True
         
         # Qwen2.5-VL形式のメッセージ
         messages = [
@@ -135,23 +220,80 @@ def test_end_to_end_inference(model):
                 "role": "user",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": "この画像の赤い部分をセグメンテーションしてください。<SEG>"}
+                    {"type": "text", "text": "この画像の赤い円形の物体をセグメンテーションしてください。<SEG>"}
                 ]
             }
         ]
         
         print("🔍 エンドツーエンド推論実行中...")
+        start_time = datetime.now()
+        
         result = model.forward_with_segmentation(
-            images=dummy_image,
+            images=test_image,
             messages=messages,
-            max_new_tokens=64
+            max_new_tokens=128
         )
+        
+        inference_time = (datetime.now() - start_time).total_seconds()
         
         print(f"✅ エンドツーエンド推論成功")
         print(f"  - 生成テキスト: {result['generated_text'][:100]}...")
         print(f"  - マスク数: {len(result['masks'])}")
         print(f"  - マスク有無: {result['has_masks']}")
         print(f"  - 拒否フラグ: {result['rejected']}")
+        print(f"  - 推論時間: {inference_time:.2f}秒")
+        
+        # 評価指標の計算（マスクがある場合）
+        if result['has_masks'] and len(result['masks']) > 0:
+            pred_mask = result['masks'][0]  # 最初のマスクを使用
+            
+            # numpy配列に変換
+            if isinstance(pred_mask, torch.Tensor):
+                pred_mask = pred_mask.cpu().numpy()
+            
+            # bool型に変換
+            pred_mask = pred_mask.astype(bool)
+            
+            # 評価指標計算
+            iou_score = calculate_iou(pred_mask, gt_mask)
+            dice_score = calculate_dice(pred_mask, gt_mask)
+            
+            print(f"\n📊 セグメンテーション評価指標:")
+            print(f"  - IoU: {iou_score:.3f}")
+            print(f"  - Dice係数: {dice_score:.3f}")
+            
+            # 結果の保存
+            if save_results:
+                # 結果保存用ディレクトリ作成
+                results_dir = os.path.join(project_root, "test_results")
+                os.makedirs(results_dir, exist_ok=True)
+                
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                
+                # マスク可視化
+                vis_path = os.path.join(results_dir, f"mask_visualization_{timestamp}.png")
+                visualize_mask(test_image, pred_mask, vis_path, 
+                             f"Segmentation Result (IoU: {iou_score:.3f})")
+                
+                # 結果をJSONで保存
+                results_json = {
+                    "timestamp": timestamp,
+                    "generated_text": result['generated_text'],
+                    "num_masks": len(result['masks']),
+                    "has_masks": result['has_masks'],
+                    "rejected": result['rejected'],
+                    "inference_time": inference_time,
+                    "evaluation_metrics": {
+                        "iou": float(iou_score),
+                        "dice": float(dice_score)
+                    }
+                }
+                
+                json_path = os.path.join(results_dir, f"test_results_{timestamp}.json")
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(results_json, f, ensure_ascii=False, indent=2)
+                
+                print(f"📄 テスト結果をJSONで保存: {json_path}")
         
         return True
         

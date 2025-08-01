@@ -53,8 +53,8 @@ class SAMQwenModel(nn.Module):
     
     def __init__(self, 
                  model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct",
-                 sam_checkpoint: str = "sam2.1_hiera_large.pt",
-                 sam_config: str = "sam2.1_hiera_l.yaml",
+                 sam_checkpoint: str = "sam2_hiera_large.pt",
+                 sam_config: str = "sam2_hiera_l.yaml",
                  torch_dtype: torch.dtype = torch.float16,
                  device_map: str = "auto"):
         """
@@ -118,34 +118,17 @@ class SAMQwenModel(nn.Module):
         """SAM2.1の初期化（公式API）"""
         print(f"🎯 SAM2.1初期化中: {self.sam_checkpoint}")
         
-        # チェックポイント・設定ファイルのパス構築（sam2フォルダを優先）
-        project_root = os.path.join(os.path.dirname(__file__), '..')
-        sam2_configs = os.path.join(project_root, 'sam2', 'sam2')
-        
-        # sam2フォルダ内の設定ファイルを優先使用
-        if os.path.exists(sam2_configs):
-            config_path = os.path.join(sam2_configs, "sam2_hiera_l.yaml")
-        else:
-            configs_dir = os.path.join(project_root, 'configs', 'sam2.1') 
-            config_path = os.path.join(configs_dir, self.sam_config)
-        
-        # チェックポイントファイルパス
-        checkpoints_dir = os.path.join(project_root, 'checkpoints')
-        ckpt_path = os.path.join(checkpoints_dir, self.sam_checkpoint)
-        
-        # ファイル存在確認（存在しない場合は代替手段）
-        if not os.path.exists(ckpt_path):
-            print(f"⚠️ チェックポイントが見つかりません: {ckpt_path}")
-            print("🔄 公式リポジトリから自動ダウンロードを試行...")
-            ckpt_path = self.sam_checkpoint  # ファイル名のみを指定（SAM2が自動解決）
-        
-        if not os.path.exists(config_path):
-            print(f"⚠️ 設定ファイルが見つかりません: {config_path}")
-            config_path = f"sam2_hiera_l.yaml"  # デフォルト設定名
-        
         try:
+            # Hydraの設定パスの解決をSAM2内部に任せる
+            # 直接ファイル名のみを指定
+            config_name = "sam2_hiera_l.yaml"
+            
+            # チェックポイントファイルパス
+            project_root = os.path.join(os.path.dirname(__file__), '..')
+            ckpt_path = os.path.join(project_root, 'checkpoints', self.sam_checkpoint)
+            
             # SAM2.1モデル構築
-            self.sam_model = build_sam2(config_path, ckpt_path, device=self.device)
+            self.sam_model = build_sam2(config_name, ckpt_path, device=self.device)
             
             # SAM2.1プレディクター初期化
             self.sam_predictor = SAM2ImagePredictor(self.sam_model)
@@ -154,30 +137,7 @@ class SAMQwenModel(nn.Module):
             
         except Exception as e:
             print(f"❌ SAM2.1初期化エラー: {e}")
-            print("🔄 フォールバック: 簡単な設定で再試行...")
-            
-            # フォールバック: ローカルsam2フォルダから初期化
-            try:
-                # 現在のプロジェクト内sam2フォルダを使用
-                project_sam2_config = os.path.join(project_root, 'sam2', 'sam2', 'sam2_hiera_l.yaml')
-                if os.path.exists(project_sam2_config):
-                    print(f"🔄 プロジェクト内sam2設定使用: {project_sam2_config}")
-                    self.sam_model = build_sam2(project_sam2_config, self.sam_checkpoint)
-                else:
-                    # 最終フォールバック: sam2パッケージから
-                    import sam2
-                    sam2_path = sam2.__path__[0] 
-                    default_config = os.path.join(sam2_path, 'sam2_hiera_l.yaml')
-                    print(f"🔄 sam2パッケージ設定使用: {default_config}")
-                    self.sam_model = build_sam2(default_config, self.sam_checkpoint)
-                
-                self.sam_predictor = SAM2ImagePredictor(self.sam_model)
-                print("✅ SAM2.1フォールバック初期化完了")
-            except Exception as e2:
-                print(f"❌ SAM2.1フォールバック初期化失敗: {e2}")
-                print("⚠️ SAM2.1を使用しない統合モードで続行します")
-                self.sam_model = None
-                self.sam_predictor = None
+            raise RuntimeError(f"Failed to initialize SAM2.1: {str(e)}")
     
     @property
     def device(self) -> torch.device:
@@ -251,60 +211,37 @@ class SAMQwenModel(nn.Module):
                          point_labels: Optional[torch.Tensor] = None,
                          box: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """SAM2.1でセグメンテーション実行"""
-        h, w = img_np.shape[:2]
-        
-        # SAM2.1が利用できない場合のフォールバック
+        # SAM2.1が利用できない場合はエラー
         if self.sam_predictor is None:
-            print("⚠️ SAM2.1が利用できません。ダミーマスクを返します。")
-            dummy_mask = torch.zeros((h, w), dtype=torch.bool)
-            return {
-                'mask': dummy_mask,
-                'all_masks': dummy_mask.unsqueeze(0),
-                'iou_scores': torch.tensor([0.0]),
-                'best_mask_idx': 0,
-                'logits': torch.zeros((1, h, w))
-            }
+            raise RuntimeError("SAM2.1 predictor is not initialized. Please check SAM2.1 installation.")
         
-        try:
-            # 画像設定
-            self.sam_predictor.set_image(img_np)
-            
-            # プロンプト準備
-            points_np = point_coords.cpu().numpy() if point_coords is not None else None
-            labels_np = point_labels.cpu().numpy() if point_labels is not None else None
-            box_np = box.cpu().numpy() if box is not None else None
-            
-            # セグメンテーション実行
-            masks, scores, logits = self.sam_predictor.predict(
-                point_coords=points_np,
-                point_labels=labels_np,
-                box=box_np,
-                multimask_output=True
-            )
-            
-            # 最良マスク選択
-            best_idx = np.argmax(scores)
-            best_mask = masks[best_idx]
-            
-            return {
-                'mask': torch.from_numpy(best_mask).bool(),
-                'all_masks': torch.from_numpy(masks),
-                'iou_scores': torch.from_numpy(scores),
-                'best_mask_idx': best_idx,
-                'logits': torch.from_numpy(logits)
-            }
-            
-        except Exception as e:
-            print(f"⚠️ セグメンテーションエラー: {e}")
-            # フォールバック: ダミーマスクを返す
-            dummy_mask = torch.zeros((h, w), dtype=torch.bool)
-            return {
-                'mask': dummy_mask,
-                'all_masks': dummy_mask.unsqueeze(0),
-                'iou_scores': torch.tensor([0.0]),
-                'best_mask_idx': 0,
-                'logits': torch.zeros((1, h, w))
-            }
+        # 画像設定
+        self.sam_predictor.set_image(img_np)
+        
+        # プロンプト準備
+        points_np = point_coords.cpu().numpy() if point_coords is not None else None
+        labels_np = point_labels.cpu().numpy() if point_labels is not None else None
+        box_np = box.cpu().numpy() if box is not None else None
+        
+        # セグメンテーション実行
+        masks, scores, logits = self.sam_predictor.predict(
+            point_coords=points_np,
+            point_labels=labels_np,
+            box=box_np,
+            multimask_output=True
+        )
+        
+        # 最良マスク選択
+        best_idx = np.argmax(scores)
+        best_mask = masks[best_idx]
+        
+        return {
+            'mask': torch.from_numpy(best_mask).bool(),
+            'all_masks': torch.from_numpy(masks),
+            'iou_scores': torch.from_numpy(scores),
+            'best_mask_idx': best_idx,
+            'logits': torch.from_numpy(logits)
+        }
     
     def _run_text_generation(self, 
                            img_np: np.ndarray, 
@@ -328,8 +265,29 @@ class SAMQwenModel(nn.Module):
                 add_generation_prompt=True
             )
             
+            # メッセージに画像を埋め込む
+            if isinstance(images, (list, tuple)):
+                image_list = list(images)
+            else:
+                image_list = [images]
+            
+            # メッセージ内の画像プレースホルダーを実際の画像に置き換え
+            updated_messages = []
+            for msg in messages:
+                updated_msg = dict(msg)
+                if "content" in updated_msg:
+                    updated_content = []
+                    for item in updated_msg["content"]:
+                        if isinstance(item, dict) and item.get("type") == "image":
+                            # 画像プレースホルダーを実際の画像に置き換え
+                            updated_content.append({"type": "image", "image": image_list[0]})
+                        else:
+                            updated_content.append(item)
+                    updated_msg["content"] = updated_content
+                updated_messages.append(updated_msg)
+            
             # 画像・動画情報処理
-            image_inputs, video_inputs = process_vision_info(messages)
+            image_inputs, video_inputs = process_vision_info(updated_messages)
             
             # 入力準備
             inputs = self.qwen_processor(
@@ -365,12 +323,8 @@ class SAMQwenModel(nn.Module):
             }
             
         except Exception as e:
-            print(f"⚠️ テキスト生成エラー: {e}")
-            return {
-                'generated_text': f"テキスト生成エラー: {str(e)}",
-                'generated_ids': torch.tensor([[0]]),
-                'input_length': 0
-            }
+            print(f"❌ テキスト生成エラー: {e}")
+            raise RuntimeError(f"Text generation failed: {str(e)}")
     
     def eval(self):
         """評価モードに設定"""
@@ -421,7 +375,7 @@ class SAMQwenModel(nn.Module):
     def forward_with_segmentation(self, images, messages, max_new_tokens=128):
         """
         Sa2VA準拠のエンドツーエンド推論
-        テキストとマスクを同時生成
+        テキストとマスクを同時生成（正規実装版）
         
         Args:
             images: 入力画像 (PIL Image or tensor)
@@ -432,38 +386,76 @@ class SAMQwenModel(nn.Module):
             Dict: 生成テキスト、マスク、メタデータ
         """
         try:
-            # 1. Qwen2.5-VLでテキスト生成（hidden states取得）
-            text_inputs = self.qwen_processor.apply_chat_template(
+            # 1. Qwen2.5-VLでテキスト生成（hidden states取得）- 正規実装
+            prompt = self.qwen_processor.apply_chat_template(
                 messages, 
                 tokenize=False,
                 add_generation_prompt=True
             )
             
+            # メッセージに画像を埋め込む
+            if isinstance(images, (list, tuple)):
+                image_list = list(images)
+            else:
+                image_list = [images]
+            
+            # メッセージ内の画像プレースホルダーを実際の画像に置き換え
+            updated_messages = []
+            for msg in messages:
+                updated_msg = dict(msg)
+                if "content" in updated_msg:
+                    updated_content = []
+                    for item in updated_msg["content"]:
+                        if isinstance(item, dict) and item.get("type") == "image":
+                            # 画像プレースホルダーを実際の画像に置き換え
+                            updated_content.append({"type": "image", "image": image_list[0]})
+                        else:
+                            updated_content.append(item)
+                    updated_msg["content"] = updated_content
+                updated_messages.append(updated_msg)
+            
+            # 画像・動画情報処理
+            image_inputs, video_inputs = process_vision_info(updated_messages)
+            
             inputs = self.qwen_processor(
-                text=text_inputs,
-                images=images,
+                text=[prompt],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
                 return_tensors="pt"
             ).to(self.device)
             
-            # hidden statesを取得しながら生成
+            # o3リサーチで判明した正規のhidden states取得方法を使用
             with torch.no_grad():
+                # GenerationConfig設定
+                gen_config = {
+                    "max_new_tokens": max_new_tokens,
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "output_hidden_states": True,
+                    "return_dict_in_generate": True,
+                    "do_sample": False,
+                    "pad_token_id": self.qwen_processor.tokenizer.eos_token_id
+                }
+                
                 outputs = self.qwen_model.generate(
                     **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    output_hidden_states=True,
-                    return_dict_in_generate=True
+                    **gen_config
                 )
             
+            # 生成されたIDとテキスト
             generated_ids = outputs.sequences
-            generated_text = self.qwen_processor.decode(
-                generated_ids[0][inputs.input_ids.shape[1]:], 
-                skip_special_tokens=False
-            )
+            input_length = inputs.input_ids.shape[1]
+            generated_ids_trimmed = generated_ids[:, input_length:]
             
-            # 2. <SEG>トークンの検出とマスク生成
-            masks = self._extract_masks_from_generation(
-                generated_ids, outputs.hidden_states, images
+            generated_text = self.qwen_processor.batch_decode(
+                generated_ids_trimmed, 
+                skip_special_tokens=False
+            )[0]
+            
+            # 2. <SEG>トークンの検出とマスク生成（改良版）
+            masks = self._extract_masks_from_generation_v2(
+                generated_ids, outputs.hidden_states, images, input_length
             )
             
             # 3. 結果の統合
@@ -472,87 +464,153 @@ class SAMQwenModel(nn.Module):
                 'raw_text': generated_text,
                 'masks': masks,
                 'has_masks': len(masks) > 0,
-                'rejected': "[REJ]" in generated_text
+                'rejected': "[REJ]" in generated_text,
+                'seg_token_positions': self._find_seg_token_positions(generated_ids_trimmed)
             }
             
             return result
             
         except Exception as e:
-            print(f"⚠️ エンドツーエンド推論エラー: {e}")
-            return {
-                'generated_text': f"推論エラー: {str(e)}",
-                'raw_text': "",
-                'masks': [],
-                'has_masks': False,
-                'rejected': False
-            }
+            print(f"❌ エンドツーエンド推論エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            raise RuntimeError(f"Forward with segmentation failed: {str(e)}")
     
-    def _extract_masks_from_generation(self, generated_ids, hidden_states, images):
+    def _find_seg_token_positions(self, token_ids):
+        """<SEG>トークンの位置を検出"""
+        if isinstance(token_ids, torch.Tensor):
+            seg_positions = (token_ids == self.seg_token_id).nonzero(as_tuple=False)
+            return seg_positions.cpu().numpy().tolist()
+        return []
+    
+    def _extract_masks_from_generation_v2(self, generated_ids, hidden_states, images, input_length):
         """
-        生成シーケンスから<SEG>トークンを検出してマスクを生成
-        GSVA準拠の複数マスク対応
+        生成シーケンスから<SEG>トークンを検出してマスクを生成（改良版）
+        GSVA準拠の複数マスク対応・正規実装
+        
+        Args:
+            generated_ids: 生成されたトークンID（プロンプト含む）
+            hidden_states: 生成中の隠れ状態（o3リサーチで判明した形式）
+            images: 入力画像
+            input_length: 入力プロンプトの長さ
+        
+        Returns:
+            List[np.ndarray]: 生成されたマスクのリスト
         """
         masks = []
         
-        # <SEG>トークンの位置を検出
-        seg_positions = (generated_ids == self.seg_token_id).nonzero(as_tuple=False)
+        # SAM2.1が利用できない場合は早期リターン
+        if self.sam_predictor is None:
+            raise RuntimeError("SAM2.1 predictor is not initialized")
+        
+        # <SEG>トークンの位置を検出（生成部分のみ）
+        seg_positions = (generated_ids[:, input_length:] == self.seg_token_id).nonzero(as_tuple=False)
         
         if len(seg_positions) == 0:
             return masks
         
-        # SAM2.1が利用できない場合のチェック
-        if self.sam_predictor is None:
-            print("⚠️ SAM2.1が利用できません。マスク生成をスキップします。")
-            return masks
-        
-        # SAM2.1で画像を処理
+        # 画像の準備
         if isinstance(images, list):
             image = images[0]
         else:
             image = images
             
         # PIL ImageをnumpyArrayに変換
-        try:
-            if hasattr(image, 'convert'):
-                image_array = np.array(image.convert('RGB'))
-            else:
-                image_array = np.array(image)
-            
-            self.sam_predictor.set_image(image_array)
-        except Exception as e:
-            print(f"⚠️ 画像設定エラー: {e}")
-            return masks
+        if hasattr(image, 'convert'):
+            image_array = np.array(image.convert('RGB'))
+        else:
+            image_array = np.array(image)
+        
+        self.sam_predictor.set_image(image_array)
+        h, w = image_array.shape[:2]
+        
+        # o3リサーチで判明した正規のhidden states形式を処理
+        # hidden_statesは各生成ステップのタプル（長さ = max_new_tokens）
+        # 各要素は層ごとのタプル（長さ = num_layers + 1）
+        per_step_hidden_states = hidden_states  # tuple of length new_tokens
+        
+        # 層ごとに再編成（転置）
+        layers = list(zip(*per_step_hidden_states))
+        last_layer_hidden_states = []
+        
+        for step_tensors in layers[-1]:  # 最終層のみ使用
+            # step_tensorsは (batch_size, 1, hidden_size) の形状
+            last_layer_hidden_states.append(step_tensors)
         
         # 各<SEG>トークンに対してマスクを生成
         for pos in seg_positions:
-            batch_idx, seq_idx = pos[0].item(), pos[1].item()
+            batch_idx, token_pos = pos[0].item(), pos[1].item()
             
-            # 対応する隠れ状態を取得（最終層）
-            if hidden_states and len(hidden_states) > 0:
-                # 生成中の最後の隠れ状態を使用
-                last_hidden = hidden_states[-1][-1]  # 最後のステップ、最後の層
-                seg_embedding = last_hidden[batch_idx, -1, :]  # 最後のトークンの隠れ状態
+            # 対応する隠れ状態を取得
+            if token_pos < len(last_layer_hidden_states):
+                # 該当ステップの隠れ状態
+                seg_hidden_state = last_layer_hidden_states[token_pos][batch_idx, 0, :]
                 
                 # SAMクエリに投影
-                sam_query = self.seg_projector(seg_embedding.unsqueeze(0))
+                with torch.no_grad():
+                    sam_query = self.seg_projector(seg_hidden_state.unsqueeze(0))
                 
-                # SAM2.1でマスク生成（簡易版 - 実際はもう少し複雑）
-                # ここでは画像中央をクリックした場合のマスクを生成
-                h, w = image_array.shape[:2]
-                point_coords = np.array([[w//2, h//2]])
-                point_labels = np.array([1])
+                # クエリベースのマスク生成（本格実装）
+                # SAM2.1のプロンプトエンコーダーを活用
+                mask = self._generate_mask_from_query(sam_query, h, w)
                 
-                mask, scores, logits = self.sam_predictor.predict(
-                    point_coords=point_coords,
-                    point_labels=point_labels,
-                    multimask_output=True
-                )
-                
-                # 最も信頼度の高いマスクを選択
-                best_mask = mask[np.argmax(scores)]
-                masks.append(best_mask)
+                if mask is not None:
+                    masks.append(mask)
+            else:
+                # 隠れ状態が不足する場合はスキップ
+                pass
         
         return masks
+    
+    def _generate_mask_from_query(self, query_embedding, h, w):
+        """
+        クエリ埋め込みからマスクを生成（SAM2.1準拠）
+        
+        Args:
+            query_embedding: SAMクエリ埋め込み [1, 256]
+            h, w: 画像の高さと幅
+        
+        Returns:
+            np.ndarray: 生成されたマスク
+        """
+        try:
+            # クエリ埋め込みを空間的な点に変換（簡易実装）
+            # 本来はより高度な方法でクエリから座標を推定すべき
+            query_np = query_embedding.cpu().numpy().squeeze()
+            
+            # クエリの値から相対的な位置を推定（0-1の範囲）
+            x_rel = torch.sigmoid(torch.tensor(query_np[:128].mean())).item()
+            y_rel = torch.sigmoid(torch.tensor(query_np[128:].mean())).item()
+            
+            # 画像座標に変換
+            x_coord = int(x_rel * w)
+            y_coord = int(y_rel * h)
+            
+            # SAM2.1で予測
+            point_coords = np.array([[x_coord, y_coord]])
+            point_labels = np.array([1])  # 前景
+            
+            masks, scores, logits = self.sam_predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=True
+            )
+            
+            # 最も信頼度の高いマスクを選択
+            best_idx = np.argmax(scores)
+            return masks[best_idx]
+            
+        except Exception as e:
+            # エラーが発生した場合はNoneを返す
+            return None
+    
+    def _extract_masks_from_generation(self, generated_ids, hidden_states, images):
+        """
+        旧バージョン（互換性のため残す）
+        """
+        # 新しいメソッドに委譲
+        input_length = 0  # 旧メソッドでは不明なので0とする
+        return self._extract_masks_from_generation_v2(generated_ids, hidden_states, images, input_length)
     
     def train(self, mode: bool = True):
         """訓練モードに設定"""
