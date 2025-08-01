@@ -193,9 +193,9 @@ def main():
     config = get_config('development')
     model_config = config.get_model_config()
     
-    # ダミーデータ生成
+    # ダミーデータ生成（段階的テスト）
     print("\n📦 ダミーデータ生成中...")
-    dummy_data = create_dummy_data(num_samples=3, img_size=224)
+    dummy_data = create_dummy_data(num_samples=3, img_size=224)  # 3つのサンプルでテスト
     print(f"✅ {len(dummy_data)}個のダミーデータを生成")
     
     # モデル初期化
@@ -209,12 +209,12 @@ def main():
         freeze_qwen_vision=True   # Qwenビジョンエンコーダも凍結
     )
     
-    # オプティマイザ設定（学習率を下げる）
+    # オプティマイザ設定（最も安全な学習率）
     trainable_params = model.get_trainable_parameters()
-    optimizer = optim.Adam(trainable_params, lr=1e-5)  # 1e-4 -> 1e-5
+    optimizer = optim.Adam(trainable_params, lr=1e-7, eps=1e-8, weight_decay=1e-5)  # 極小学習率と重み減衰
     
-    # 学習設定
-    num_epochs = 10
+    # 学習設定（段階的拡張テスト）
+    num_epochs = 3  # 複数エポックテスト
     device = model.device
     
     # 結果保存用
@@ -228,13 +228,81 @@ def main():
     print(f"\n🎯 学習開始 (エポック数: {num_epochs})")
     print("-" * 50)
     
+    # mask_headを事前に作成して固定（NaN問題対策）
+    print("🔧 mask_head初期化中...")
+    with torch.no_grad():
+        # ダミーの前向き計算でmask_headを作成
+        dummy_image = dummy_data[0][0]
+        dummy_messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": dummy_data[0][1]}
+            ]
+        }]
+        # 推論モードで一度実行してmask_headを初期化
+        model.eval()
+        _ = model.forward_with_segmentation(
+            images=dummy_image,
+            messages=dummy_messages,
+            max_new_tokens=32
+        )
+        model.train()
+    print("✅ mask_head初期化完了（動的作成を回避）")
+    
     # 学習ループ
     for epoch in range(num_epochs):
+        # エポック間でモデル状態をリセット（NaN対策）
+        if epoch > 0:
+            print(f"\n🔄 エポック {epoch+1} 開始: モデル状態リセット中...")
+            model.eval()
+            torch.cuda.empty_cache()  # GPU キャッシュクリア
+            model.train()
+            # mask_headを再初期化
+            with torch.no_grad():
+                dummy_image = dummy_data[0][0]
+                dummy_messages = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": dummy_data[0][1]}
+                    ]
+                }]
+                model.eval()
+                _ = model.forward_with_segmentation(
+                    images=dummy_image,
+                    messages=dummy_messages,
+                    max_new_tokens=32
+                )
+                model.train()
+            print("✅ モデル状態リセット完了")
+        
         epoch_loss = 0.0
         epoch_metrics = {'iou': 0.0, 'dice': 0.0}
         
-        # 各サンプルで学習
+        # 各サンプルで学習（完全独立処理）
+        accumulated_loss = 0.0
         for i, (image, instruction, target_mask) in enumerate(dummy_data):
+            # 各サンプル毎にmask_headを再初期化（NaN完全回避）
+            print(f"\n🔧 サンプル {i+1}: mask_head再初期化中...")
+            model.eval()
+            torch.cuda.empty_cache()  # GPU キャッシュクリア
+            with torch.no_grad():
+                _ = model.forward_with_segmentation(
+                    images=image,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image"},
+                            {"type": "text", "text": instruction}
+                        ]
+                    }],
+                    max_new_tokens=32
+                )
+            model.train()
+            optimizer.zero_grad()
+            print(f"✅ サンプル {i+1} mask_head再初期化完了")
+            
             # メッセージ形式に変換
             messages = [{
                 "role": "user",
@@ -247,13 +315,24 @@ def main():
             # ターゲットマスクをテンソルに変換
             target_mask_tensor = torch.from_numpy(target_mask).float().to(device)
             
-            # Forward pass
-            results = model.forward_train(
-                images=image,
-                messages=messages,
-                target_masks=target_mask_tensor,
-                max_new_tokens=32
-            )
+            # サンプル処理前のデバッグ情報
+            print(f"\n--- サンプル {i+1} 処理開始 ---")
+            print(f"  - 画像タイプ: {type(image)}")
+            print(f"  - ターゲットマスク統計: min={target_mask.min():.6f}, max={target_mask.max():.6f}, mean={target_mask.mean():.6f}")
+            print(f"  - ターゲットマスクNaN/Inf: NaN={np.isnan(target_mask).sum()}, Inf={np.isinf(target_mask).sum()}")
+            
+            # Forward pass（既存のmask_headを使用）
+            try:
+                results = model.forward_train(
+                    images=image,
+                    messages=messages,
+                    target_masks=target_mask_tensor,
+                    max_new_tokens=32
+                )
+            except Exception as e:
+                print(f"\n❌ Forward pass中にエラー: {str(e)}")
+                print(f"エポック {epoch+1}, サンプル {i+1}")
+                return
             
             # 損失取得
             loss = results['total_loss']
@@ -267,20 +346,77 @@ def main():
                 print(f"  - has_masks: {results.get('has_masks', False)}")
                 print(f"  - losses dict: {results.get('losses', {})}")
                 
-                # 勾配の確認
-                if epoch == 0:
-                    for name, param in model.named_parameters():
-                        if param.requires_grad and param.grad is not None:
-                            grad_norm = param.grad.norm().item()
-                            if grad_norm > 1.0 or torch.isnan(param.grad).any():
-                                print(f"  ⚠️ 大きな勾配 {name}: norm={grad_norm:.4f}")
+                # より詳細な損失成分の確認
+                if 'losses' in results:
+                    for loss_name, loss_value in results['losses'].items():
+                        if torch.isnan(loss_value) or torch.isinf(loss_value):
+                            print(f"  ❌ NaN/Inf検出: {loss_name} = {loss_value}")
+                        else:
+                            print(f"  ✅ 正常: {loss_name} = {loss_value:.6f}")
+                
+                # マスクの統計情報
+                if results.get('has_masks') and len(results['masks']) > 0:
+                    pred_mask = results['masks'][0]
+                    if isinstance(pred_mask, np.ndarray):
+                        pred_mask = torch.from_numpy(pred_mask)
+                    print(f"  - マスク統計: min={pred_mask.min():.6f}, max={pred_mask.max():.6f}, mean={pred_mask.mean():.6f}")
+                    print(f"  - マスク形状: {pred_mask.shape}")
+                    print(f"  - NaN/Inf含有: NaN={torch.isnan(pred_mask).sum()}, Inf={torch.isinf(pred_mask).sum()}")
+                
+                # 投影層の出力確認
+                if 'seg_query' in results:
+                    seg_query = results['seg_query']
+                    print(f"  - seg_query統計: min={seg_query.min():.6f}, max={seg_query.max():.6f}, mean={seg_query.mean():.6f}")
+                    print(f"  - seg_query NaN/Inf: NaN={torch.isnan(seg_query).sum()}, Inf={torch.isinf(seg_query).sum()}")
+            
+            # NaN検出時の早期停止
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n❌ エポック {epoch+1}, サンプル {i+1} でNaN/Inf検出: {loss}")
+                print("早期停止します。")
+                return
             
             # Backward pass
-            optimizer.zero_grad()
+            
+            # 勾配計算前のパラメータ状態確認
+            if i == 0 and epoch == 0:
+                print(f"\n勾配計算前パラメータチェック:")
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
+                        if torch.isnan(param).any() or torch.isinf(param).any():
+                            print(f"  ❌ パラメータ異常 {name}: NaN={torch.isnan(param).sum()}, Inf={torch.isinf(param).sum()}")
+            
             loss.backward()
             
-            # 勾配クリッピング（安定性のため、より厳しく）
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.1)
+            # 勾配の詳細な監視
+            max_grad_norm = 0.0
+            nan_grad_params = []
+            large_grad_params = []
+            
+            for name, param in model.named_parameters():
+                if param.requires_grad and param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    max_grad_norm = max(max_grad_norm, grad_norm)
+                    
+                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                        nan_grad_params.append((name, grad_norm))
+                    elif grad_norm > 1.0:
+                        large_grad_params.append((name, grad_norm))
+            
+            # デバッグ出力
+            if i == 0:
+                print(f"  - 最大勾配ノルム: {max_grad_norm:.6f}")
+                if nan_grad_params:
+                    print(f"  ❌ NaN/Inf勾配: {[f'{name}:{norm:.4f}' for name, norm in nan_grad_params]}")
+                if large_grad_params:
+                    print(f"  ⚠️ 大きな勾配: {[f'{name}:{norm:.4f}' for name, norm in large_grad_params[:3]]}")  # 最初の3つのみ表示
+            
+            # NaN勾配検出時の早期停止
+            if nan_grad_params:
+                print(f"\n❌ NaN勾配検出により学習を停止します")
+                return
+            
+            # 極めて厳格な勾配クリッピング（NaN対策）
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.01)
             
             optimizer.step()
             
