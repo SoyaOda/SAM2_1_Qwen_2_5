@@ -1,6 +1,23 @@
 """
-Simple Loss Functions for SAM2.1 + Qwen2.5-VL Integration
-シンプルな損失関数の実装
+Numerically Stable Loss Functions for SAM2.1 + Qwen2.5-VL Integration
+
+This module implements focal loss and dice loss with numerical stability improvements
+based on 2024-2025 best practices:
+
+1. Focal Loss:
+   - Uses binary_cross_entropy_with_logits for numerical stability
+   - Implements probability clipping (epsilon = 1e-6) to prevent log(0)
+   - Ensures FP32 computation for loss calculation
+   - Follows torchvision.ops.sigmoid_focal_loss approach
+
+2. Dice Loss:
+   - Uses smoothing factor to prevent division by zero
+   - Implements proper tensor shape handling
+
+References:
+- torchvision.ops.sigmoid_focal_loss implementation
+- Segmentation Models PyTorch library best practices
+- FoodLMM stable loss implementations
 """
 import torch
 import torch.nn as nn
@@ -28,6 +45,8 @@ class FocalLoss(nn.Module):
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
+        Numerically stable focal loss implementation following 2024-2025 best practices.
+        
         Args:
             pred: Predicted logits [B, H, W] or [B, 1, H, W]
             target: Ground truth labels [B, H, W] or [B, 1, H, W]
@@ -41,23 +60,32 @@ class FocalLoss(nn.Module):
         if target.dim() == 4 and target.size(1) == 1:
             target = target.squeeze(1)
         
-        # Convert to probabilities
+        # Ensure FP32 for numerical stability
         if pred.dtype != torch.float32:
             pred = pred.float()
         if target.dtype != torch.float32:
             target = target.float()
         
-        # Compute BCE loss
+        # Compute BCE loss using numerically stable implementation
         bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
         
-        # Compute probabilities
-        p_t = torch.exp(-bce_loss)
+        # Compute probabilities with clipping for numerical stability
+        # Avoid log(0) and log(1-p) where p=1
+        eps = 1e-6
+        probs = torch.sigmoid(pred)
+        probs = torch.clamp(probs, min=eps, max=1.0 - eps)
         
-        # Apply alpha weighting
-        alpha_t = self.alpha * target + (1 - self.alpha) * (1 - target)
+        # Compute p_t: probability of the true class
+        p_t = torch.where(target == 1.0, probs, 1.0 - probs)
         
-        # Apply focal term
-        focal_weight = alpha_t * (1 - p_t) ** self.gamma
+        # Apply alpha weighting (class balancing)
+        if self.alpha >= 0:
+            alpha_t = torch.where(target == 1.0, self.alpha, 1.0 - self.alpha)
+        else:
+            alpha_t = 1.0
+        
+        # Apply focal term: (1 - p_t)^gamma
+        focal_weight = alpha_t * torch.pow(1.0 - p_t, self.gamma)
         focal_loss = focal_weight * bce_loss
         
         # Apply reduction
@@ -87,6 +115,8 @@ class DiceLoss(nn.Module):
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
+        Numerically stable Dice loss implementation.
+        
         Args:
             pred: Predicted probabilities [B, H, W] or [B, 1, H, W]
             target: Ground truth labels [B, H, W] or [B, 1, H, W]
@@ -100,20 +130,36 @@ class DiceLoss(nn.Module):
         if target.dim() == 4 and target.size(1) == 1:
             target = target.squeeze(1)
         
+        # Ensure FP32 for numerical stability
+        if pred.dtype != torch.float32:
+            pred = pred.float()
+        if target.dtype != torch.float32:
+            target = target.float()
+        
         # Convert pred to probabilities if logits
         if pred.min() < 0 or pred.max() > 1:
             pred = torch.sigmoid(pred)
+        
+        # Clamp probabilities for numerical stability
+        eps = 1e-7  # Small epsilon for numerical stability
+        pred = torch.clamp(pred, min=eps, max=1.0 - eps)
         
         # Flatten tensors
         pred_flat = pred.view(pred.size(0), -1)
         target_flat = target.view(target.size(0), -1)
         
-        # Compute Dice coefficient
+        # Compute Dice coefficient with smoothing
+        # Use double smoothing: both numerator and denominator
         intersection = (pred_flat * target_flat).sum(dim=1)
-        dice_coeff = (2 * intersection + self.smooth) / (pred_flat.sum(dim=1) + target_flat.sum(dim=1) + self.smooth)
+        dice_coeff = (2.0 * intersection + self.smooth) / (
+            pred_flat.sum(dim=1) + target_flat.sum(dim=1) + self.smooth
+        )
         
         # Dice loss = 1 - Dice coefficient
-        dice_loss = 1 - dice_coeff
+        dice_loss = 1.0 - dice_coeff
+        
+        # Clamp dice loss to prevent negative values due to numerical errors
+        dice_loss = torch.clamp(dice_loss, min=0.0)
         
         # Apply reduction
         if self.reduction == 'mean':
@@ -122,6 +168,64 @@ class DiceLoss(nn.Module):
             return dice_loss.sum()
         else:
             return dice_loss
+
+
+class TorchvisionFocalLoss(nn.Module):
+    """
+    Focal Loss implementation following torchvision.ops.sigmoid_focal_loss approach.
+    This is the most numerically stable implementation available as of 2024-2025.
+    """
+    
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = 'mean'):
+        """
+        Args:
+            alpha: Weighting factor in range [0, 1] to balance positive vs negative examples
+            gamma: Exponent of the modulating factor to balance easy vs hard examples
+            reduction: Reduction method ('mean', 'sum', 'none')
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Compute focal loss following the torchvision implementation.
+        
+        Args:
+            inputs: Predicted logits [B, H, W] or [B, 1, H, W]
+            targets: Ground truth labels [B, H, W] or [B, 1, H, W]
+        
+        Returns:
+            Focal loss value
+        """
+        # Ensure same shape
+        if inputs.dim() == 4 and inputs.size(1) == 1:
+            inputs = inputs.squeeze(1)
+        if targets.dim() == 4 and targets.size(1) == 1:
+            targets = targets.squeeze(1)
+        
+        # Ensure FP32 for numerical stability
+        inputs = inputs.float()
+        targets = targets.float()
+        
+        # Compute probabilities and BCE loss
+        p = torch.sigmoid(inputs)
+        ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+        p_t = p * targets + (1 - p) * (1 - targets)
+        loss = ce_loss * ((1 - p_t) ** self.gamma)
+
+        if self.alpha >= 0:
+            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+            loss = alpha_t * loss
+
+        # Apply reduction
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:
+            return loss
 
 
 class CombinedSegmentationLoss(nn.Module):
@@ -134,19 +238,26 @@ class CombinedSegmentationLoss(nn.Module):
                  focal_weight: float = 1.0,
                  dice_weight: float = 1.0,
                  focal_alpha: float = 0.25,
-                 focal_gamma: float = 2.0):
+                 focal_gamma: float = 2.0,
+                 use_torchvision_focal: bool = True):
         """
         Args:
             focal_weight: Weight for focal loss component
             dice_weight: Weight for dice loss component
             focal_alpha: Alpha parameter for focal loss
             focal_gamma: Gamma parameter for focal loss
+            use_torchvision_focal: Whether to use TorchvisionFocalLoss (more stable)
         """
         super().__init__()
         self.focal_weight = focal_weight
         self.dice_weight = dice_weight
         
-        self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        # Choose focal loss implementation
+        if use_torchvision_focal:
+            self.focal_loss = TorchvisionFocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        else:
+            self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        
         self.dice_loss = DiceLoss()
     
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -286,6 +397,7 @@ def create_loss_function(config: Dict) -> nn.Module:
 # Export functions and classes
 __all__ = [
     'FocalLoss',
+    'TorchvisionFocalLoss',
     'DiceLoss', 
     'CombinedSegmentationLoss',
     'MultiModalLoss',

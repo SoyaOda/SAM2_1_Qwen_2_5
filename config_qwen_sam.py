@@ -63,13 +63,15 @@ class SAMQwenConfig:
             'eps': 1e-8
         }
         
-        # Loss function settings
+        # Loss function settings - using 2024-2025 numerically stable implementations
         self.LOSS_CONFIG = {
             'segmentation_loss_weight': 1.0,
             'text_loss_weight': 1.0,
             'use_focal_loss': True,
             'focal_alpha': 0.25,
-            'focal_gamma': 2.0
+            'focal_gamma': 2.0,
+            'use_torchvision_focal': True,  # Use more stable torchvision-style implementation
+            'dice_smooth': 1e-6  # Smoothing factor for Dice loss
         }
         
         # Memory optimization settings

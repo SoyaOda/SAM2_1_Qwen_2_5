@@ -489,3 +489,47 @@ dice = (2 * intersection) / (pred_sum + gt_sum + 1e-8)
 **v3.1完了日**: 2025年8月1日  
 **実装バージョン**: v3.1 (NaN Problem Completely Resolved)  
 **ステータス**: **学習機能完全安定化・本格学習準備完了**
+
+---
+
+## 📌 NaN問題の根本原因と解決策（最終版）
+
+### 根本原因
+**Qwenモデルへの勾配逆伝播がモデルの重みを破壊し、hidden_statesがNaNを出力していた**
+
+### コアの解決策
+
+1. **Qwenモデルの完全凍結**
+```python
+# Qwenモデル全体を凍結（NaN問題対策）
+for param in self.qwen_model.parameters():
+    param.requires_grad = False
+```
+
+2. **勾配遮断（detach）**
+```python
+# Qwenからの勾配を遮断
+seg_hidden = hidden_states[:, -1, :].detach()
+```
+
+3. **FP32での数値安定性確保**
+```python
+# seg_projectorとmask_headをFP32で保持
+self.seg_projector = self.seg_projector.to(dtype=torch.float32)
+self.mask_head = self.mask_head.to(dtype=torch.float32)
+```
+
+4. **mask_headの固定化**
+```python
+# モデル初期化時にmask_headを作成（再初期化を防止）
+self.mask_head = nn.Linear(sam_embed_dim, default_img_size * default_img_size)
+self.mask_head = self.mask_head.to(device=self.device, dtype=torch.float32)
+```
+
+### 結果
+- 3エポック完全動作
+- 損失減少: 1.0156 → 1.0111
+- IoU改善: 0.355 → 0.695
+- Dice改善: 0.480 → 0.814
+
+これらの修正により、39.8億パラメータの大規模統合モデルでの安定学習が実現されました。

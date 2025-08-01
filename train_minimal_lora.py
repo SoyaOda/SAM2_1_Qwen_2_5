@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SAM2.1 + Qwen2.5-VL統合モデル最小学習スクリプト
+SAM2.1 + Qwen2.5-VL統合モデル最小学習スクリプト（LoRA/QLoRA版）
 o3_spec4.mdに基づくダミーデータでの学習検証
 """
 import torch
@@ -23,6 +23,7 @@ if os.path.exists(sam2_path):
 
 from config_qwen_sam import get_config
 from model.sam_qwen_model import create_sam_qwen_model
+from model.lora_config import create_lora_manager
 
 
 def create_dummy_data(num_samples: int = 3, img_size: int = 224) -> List[Tuple[Image.Image, str, np.ndarray]]:
@@ -184,37 +185,45 @@ def visualize_training_progress(epoch_data: List[Dict], save_path: str):
 
 
 def main():
-    """メイン学習ループ"""
+    """メイン学習ループ（LoRA版）"""
     print("=" * 70)
-    print("🚀 SAM2.1 + Qwen2.5-VL最小学習開始")
+    print("🚀 SAM2.1 + Qwen2.5-VL最小学習開始（LoRA版）")
     print("=" * 70)
     
     # 設定
     config = get_config('development')
     model_config = config.get_model_config()
     
+    # LoRA設定の作成
+    lora_manager = create_lora_manager(
+        use_qlora=False,  # 通常のLoRA（QLoRAは簡略化のため無効）
+        qwen_r=16,        # Qwen LoRAランク
+        sam_r=16,         # SAM LoRAランク
+        qwen_lora_dropout=0.05,
+        sam_lora_dropout=0.1
+    )
+    
     # ダミーデータ生成（段階的テスト）
     print("\n📦 ダミーデータ生成中...")
     dummy_data = create_dummy_data(num_samples=3, img_size=224)  # 3つのサンプルでテスト
     print(f"✅ {len(dummy_data)}個のダミーデータを生成")
     
-    # モデル初期化
-    print("\n🤖 モデル初期化中...")
-    model = create_sam_qwen_model(model_config)
+    # モデル初期化（LoRA設定を渡す）
+    print("\n🤖 モデル初期化中（LoRA有効）...")
+    model = create_sam_qwen_model(model_config, lora_config=lora_manager)
     model.train()
     
-    # 学習用設定
+    # 学習用設定（LoRA前提のシンプル版）
     model.configure_for_training(
-        freeze_sam_encoder=True,  # SAMエンコーダは凍結
-        freeze_qwen_vision=True   # Qwenビジョンエンコーダも凍結
+        freeze_sam_encoder=True  # SAMエンコーダは凍結
     )
     
-    # オプティマイザ設定（適切な学習率）
+    # オプティマイザ設定（LoRA用の学習率）
     trainable_params = model.get_trainable_parameters()
-    optimizer = optim.Adam(trainable_params, lr=1e-4, eps=1e-8, weight_decay=1e-4)  # 標準的な学習率と重み減衰
+    optimizer = optim.Adam(trainable_params, lr=2e-4, eps=1e-8, weight_decay=1e-4)  # LoRA推奨学習率
     
     # 学習設定（段階的拡張テスト）
-    num_epochs = 3  # 複数エポックテスト
+    num_epochs = 5  # LoRAでは高速に収束するため少なめ
     device = model.device
     
     # 結果保存用
@@ -225,7 +234,7 @@ def main():
     # 学習履歴
     training_history = []
     
-    print(f"\n🎯 学習開始 (エポック数: {num_epochs})")
+    print(f"\n🎯 学習開始 (エポック数: {num_epochs}, LoRA有効)")
     print("-" * 50)
     
     # mask_headはモデル初期化時に作成済み
@@ -280,13 +289,10 @@ def main():
                 return
             
             # Backward pass
-            
-            
             loss.backward()
             
-            
-            # 勾配クリッピング（標準的な値）
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            # 勾配クリッピング（LoRAでは小さめの値）
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
             
             optimizer.step()
             
@@ -323,6 +329,26 @@ def main():
     
     print("-" * 50)
     print("✅ 学習完了！")
+    
+    # LoRAパラメータのみの統計を表示
+    if hasattr(model, 'lora_config'):
+        print("\n📊 LoRAパラメータ統計:")
+        lora_params = 0
+        qwen_lora_params = 0
+        sam_lora_params = 0
+        for name, param in model.named_parameters():
+            if 'lora' in name.lower() and param.requires_grad:
+                lora_params += param.numel()
+                if 'qwen' in name:
+                    qwen_lora_params += param.numel()
+                elif 'sam' in name or 'mask_decoder' in name:
+                    sam_lora_params += param.numel()
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"  - 総LoRAパラメータ数: {lora_params:,}")
+        print(f"    - Qwen LoRA: {qwen_lora_params:,}")
+        print(f"    - SAM LoRA: {sam_lora_params:,}")
+        print(f"  - 総パラメータ数: {total_params:,}")
+        print(f"  - LoRAパラメータ比率: {lora_params/total_params*100:.2f}%")
     
     # 最終評価
     print("\n📊 最終評価:")
@@ -375,25 +401,25 @@ def main():
                     axes[2].axis('off')
                     
                     plt.tight_layout()
-                    vis_path = os.path.join(results_dir, f"result_{timestamp}.png")
+                    vis_path = os.path.join(results_dir, f"result_lora_{timestamp}.png")
                     plt.savefig(vis_path, dpi=150)
                     plt.close()
                     print(f"\n📸 結果を保存: {vis_path}")
     
     # 学習履歴の可視化
     if len(training_history) > 0:
-        progress_path = os.path.join(results_dir, f"training_progress_{timestamp}.png")
+        progress_path = os.path.join(results_dir, f"training_progress_lora_{timestamp}.png")
         visualize_training_progress(training_history, progress_path)
     
     # 学習履歴をテキストで保存
-    history_path = os.path.join(results_dir, f"training_history_{timestamp}.txt")
+    history_path = os.path.join(results_dir, f"training_history_lora_{timestamp}.txt")
     with open(history_path, 'w') as f:
         f.write("Epoch\tLoss\tIoU\tDice\n")
         for h in training_history:
             f.write(f"{h['epoch']}\t{h['loss']:.4f}\t{h['iou']:.3f}\t{h['dice']:.3f}\n")
     print(f"📄 学習履歴を保存: {history_path}")
     
-    print("\n🎉 最小学習テスト完了！")
+    print("\n🎉 最小学習テスト（LoRA版）完了！")
     
     # 損失が減少したかチェック
     if len(training_history) > 1:

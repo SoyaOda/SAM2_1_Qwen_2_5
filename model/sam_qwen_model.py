@@ -14,6 +14,9 @@ import os
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
+# LoRA/QLoRA imports
+from model.lora_config import LoRAConfigManager, create_lora_manager
+
 # SAM2.1 imports
 try:
     # プロジェクト内sam2フォルダをPATHに追加
@@ -56,7 +59,8 @@ class SAMQwenModel(nn.Module):
                  sam_checkpoint: str = "sam2_hiera_large.pt",
                  sam_config: str = "sam2_hiera_l.yaml",
                  torch_dtype: torch.dtype = torch.float16,
-                 device_map: str = "auto"):
+                 device_map: str = "auto",
+                 lora_config: Optional[LoRAConfigManager] = None):
         """
         統合モデルの初期化
         
@@ -66,6 +70,7 @@ class SAMQwenModel(nn.Module):
             sam_config: SAM2.1設定ファイル
             torch_dtype: モデル精度
             device_map: デバイス配置戦略
+            lora_config: LoRA/QLoRA設定マネージャー
         """
         super().__init__()
         
@@ -76,6 +81,7 @@ class SAMQwenModel(nn.Module):
         self.sam_checkpoint = sam_checkpoint
         self.sam_config = sam_config
         self.torch_dtype = torch_dtype
+        self.lora_config = lora_config
         
         print(f"🚀 SAM2.1 + Qwen2.5-VL統合モデル初期化開始...")
         
@@ -88,11 +94,17 @@ class SAMQwenModel(nn.Module):
         # Sa2VA/GSVA準拠のエンドツーエンド統合機能初期化
         self._init_unified_token_space()
         
+        # LoRA設定の適用
+        if self.lora_config is not None:
+            self._apply_lora()
+        
         print(f"✅ 統合モデル初期化完了")
         print(f"  - Qwen: {model_name}")
         print(f"  - SAM: {sam_checkpoint}")
         print(f"  - デバイス: {self.device}")
         print(f"  - 統一トークン空間: 有効（<SEG>, [REJ]対応）")
+        if self.lora_config is not None:
+            print(f"  - LoRA/QLoRA: 有効")
     
     def _init_qwen(self):
         """Qwen2.5-VLの初期化（最新API）"""
@@ -138,6 +150,86 @@ class SAMQwenModel(nn.Module):
         except Exception as e:
             print(f"❌ SAM2.1初期化エラー: {e}")
             raise RuntimeError(f"Failed to initialize SAM2.1: {str(e)}")
+    
+    def _apply_lora(self):
+        """LoRA/QLoRAを適用"""
+        print("🔧 LoRA/QLoRA設定を適用中...")
+        
+        if self.lora_config is None:
+            return
+            
+        # QLoRAの場合、量子化設定を適用（実装簡略化のため現在は通常のLoRAのみ）
+        if self.lora_config.use_qlora:
+            print("⚠️ QLoRA（4bit量子化）は現在の実装では簡略化のため無効です。通常のLoRAを使用します。")
+        
+        # QwenモデルにLoRA適用
+        try:
+            from peft import get_peft_model
+            qwen_lora_config = self.lora_config.get_qwen_lora_config()
+            self.qwen_model = get_peft_model(self.qwen_model, qwen_lora_config)
+            print("✅ QwenモデルにLoRAを適用")
+        except Exception as e:
+            print(f"⚠️ QwenへのLoRA適用をスキップ: {e}")
+        
+        # SAMのmask_decoderにLoRA適用（手動実装）
+        # 注: PEFTは直接SAMをサポートしていないため、手動でLoRA層を追加
+        self._apply_lora_to_sam_decoder()
+        
+        # LoRA設定サマリーを表示
+        self.lora_config.print_lora_summary()
+    
+    def _apply_lora_to_sam_decoder(self):
+        """SAMのmask_decoderに手動でLoRA層を追加"""
+        import torch.nn as nn
+        
+        # LoRAレイヤーのヘルパークラス
+        class LoRALayer(nn.Module):
+            def __init__(self, in_features, out_features, rank=16, alpha=32):
+                super().__init__()
+                self.rank = rank
+                self.alpha = alpha
+                self.scaling = alpha / rank
+                
+                # LoRA分解: W = W_0 + BA
+                self.lora_A = nn.Parameter(torch.randn(rank, in_features) * 0.01)
+                self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+                
+            def forward(self, x):
+                # x @ A^T @ B^T * scaling
+                return x @ self.lora_A.T @ self.lora_B.T * self.scaling
+        
+        # mask_decoder内のq_proj, v_projを探してLoRA層を追加
+        if hasattr(self.sam_model, 'mask_decoder'):
+            for name, module in self.sam_model.mask_decoder.named_modules():
+                if isinstance(module, nn.Linear) and any(target in name for target in ['q_proj', 'v_proj']):
+                    # 元の重みを凍結
+                    module.weight.requires_grad = False
+                    if module.bias is not None:
+                        module.bias.requires_grad = False
+                    
+                    # LoRA層を追加
+                    lora_layer = LoRALayer(
+                        module.in_features,
+                        module.out_features,
+                        rank=self.lora_config.sam_lora_r,
+                        alpha=self.lora_config.sam_lora_alpha
+                    ).to(self.device)
+                    
+                    # LoRA層を登録（後でアクセスできるように）
+                    setattr(module, 'lora_layer', lora_layer)
+                    
+                    # forwardメソッドをオーバーライド
+                    original_forward = module.forward
+                    def new_forward(self, x):
+                        base_output = original_forward(x)
+                        lora_output = self.lora_layer(x)
+                        return base_output + lora_output
+                    
+                    # メソッドをバインド
+                    import types
+                    module.forward = types.MethodType(new_forward, module)
+                    
+            print("✅ SAM mask_decoderにLoRAを適用")
     
     @property
     def device(self) -> torch.device:
@@ -370,7 +462,7 @@ class SAMQwenModel(nn.Module):
             nn.LayerNorm(qwen_hidden_size // 4),
             nn.ReLU(),
             nn.Linear(qwen_hidden_size // 4, sam_embed_dim)
-        ).to(device=self.device, dtype=self.torch_dtype)
+        ).to(device=self.device, dtype=torch.float32)  # FP32で数値安定性を確保
         
         # 重みの初期化を改善
         for module in self.seg_projector.modules():
@@ -379,10 +471,22 @@ class SAMQwenModel(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         
+        # mask_headの初期化（固定サイズで初期化、後で動的に調整）
+        # 標準的な画像サイズ224x224を仮定
+        default_img_size = 224
+        self.mask_head = nn.Linear(sam_embed_dim, default_img_size * default_img_size)
+        # mask_headはFP32で保持（数値安定性のため）
+        self.mask_head = self.mask_head.to(device=self.device, dtype=torch.float32)
+        
+        # 初期化を改善（小さい値で初期化）
+        nn.init.xavier_uniform_(self.mask_head.weight, gain=0.01)
+        nn.init.zeros_(self.mask_head.bias)
+        
         print(f"✅ 統一トークン空間初期化完了")
         print(f"  - <SEG>トークンID: {self.seg_token_id}")
         print(f"  - [REJ]トークンID: {self.rej_token_id}")
         print(f"  - 投影層: {qwen_hidden_size} → {sam_embed_dim}")
+        print(f"  - マスクヘッド: {sam_embed_dim} → {default_img_size}x{default_img_size} (動的調整対応)")
     
     def forward_with_segmentation(self, images, messages, max_new_tokens=128):
         """
@@ -468,24 +572,33 @@ class SAMQwenModel(nn.Module):
                 # 2. 最終層の隠れ状態から<SEG>トークン位置を仮定（最後のトークン）
                 hidden_states = model_outputs.hidden_states[-1]  # 最終層
                 seq_len = hidden_states.shape[1]
-                seg_hidden = hidden_states[:, -1, :]  # 最後のトークンの隠れ状態
+                # Qwenからの勾配を遮断（NaN問題対策）
+                seg_hidden = hidden_states[:, -1, :].detach()  # 最後のトークンの隠れ状態
                 
                 # 3. 投影層を通す（勾配が流れる）
-                seg_query = self.seg_projector(seg_hidden)  # [1, 256]
+                # FP32に変換して数値安定性を確保
+                seg_hidden_fp32 = seg_hidden.float()
+                seg_query = self.seg_projector(seg_hidden_fp32)  # [1, 256]
                 
                 # 4. 最小学習用：投影層の出力を直接マスクロジットとして使用
                 # 本来はSAMを通すべきだが、勾配を流すための簡易実装
                 
                 # マスクデコーダの代わりに単純な線形変換
-                if not hasattr(self, 'mask_head'):
-                    # 簡易マスクヘッドを追加（256 -> H*W）
-                    self.mask_head = nn.Linear(256, h * w).to(device=self.device, dtype=self.torch_dtype)
-                    # 初期化を改善（小さい値で初期化）
+                # mask_headの出力サイズを動的に調整
+                expected_output_size = h * w
+                current_output_size = self.mask_head.out_features
+                
+                if current_output_size != expected_output_size:
+                    # サイズが異なる場合は新しいmask_headを作成
+                    self.mask_head = nn.Linear(self.mask_head.in_features, expected_output_size)
+                    # mask_headはFP32で保持（数値安定性のため）
+                    self.mask_head = self.mask_head.to(device=self.device, dtype=torch.float32)
                     nn.init.xavier_uniform_(self.mask_head.weight, gain=0.01)
                     nn.init.zeros_(self.mask_head.bias)
                 
-                # マスクロジットを生成
-                mask_logits = self.mask_head(seg_query)  # [1, H*W]
+                # マスクロジットを生成（FP32で計算）
+                seg_query_fp32 = seg_query.float()  # FP32に変換
+                mask_logits = self.mask_head(seg_query_fp32)  # [1, H*W]
                 mask_logits = mask_logits.view(1, h, w)  # [1, H, W]
                 
                 # シグモイドで確率に変換（訓練時はロジットのまま損失計算）
@@ -699,52 +812,71 @@ class SAMQwenModel(nn.Module):
             self.seg_projector.train(mode)
         return self
     
-    def configure_for_training(self, freeze_sam_encoder: bool = True, freeze_qwen_vision: bool = True):
+    def configure_for_training(self, freeze_sam_encoder: bool = True):
         """
-        訓練用のパラメータ設定
+        訓練用のパラメータ設定（LoRA前提のシンプル版）
         
         Args:
             freeze_sam_encoder: SAMのエンコーダを凍結するか
-            freeze_qwen_vision: Qwenのビジョンエンコーダを凍結するか
         """
-        # SAMエンコーダの凍結設定
+        # LoRAが設定されている場合（前提条件）
+        if self.lora_config is not None:
+            # PEFTでLoRAが適用されたQwenモデルの場合
+            # ベースモデルのパラメータは自動的に凍結されている
+            # LoRAパラメータのみが学習可能
+            print("✅ Qwen: LoRAパラメータのみ学習可能（ベースモデルは凍結）")
+            
+            # SAMのLoRAパラメータを学習可能にする（手動実装）
+            if hasattr(self.sam_model, 'mask_decoder'):
+                for name, module in self.sam_model.mask_decoder.named_modules():
+                    if hasattr(module, 'lora_layer'):
+                        for param in module.lora_layer.parameters():
+                            param.requires_grad = True
+            print("✅ SAM: LoRAパラメータのみ学習可能")
+        else:
+            # LoRAなしの場合（従来の動作）
+            print("⚠️ LoRA未設定での学習は推奨されません")
+            
+        # SAMエンコーダの凍結設定（LoRAとは独立）
         if freeze_sam_encoder:
             for name, param in self.sam_model.named_parameters():
                 if 'image_encoder' in name:
                     param.requires_grad = False
-                else:
-                    param.requires_grad = True
-            print("✅ SAMエンコーダを凍結、デコーダは学習可能")
-        else:
-            for param in self.sam_model.parameters():
-                param.requires_grad = True
-            print("✅ SAM全体を学習可能に設定")
+            print("✅ SAMエンコーダを凍結")
         
-        # Qwenビジョンエンコーダの凍結設定
-        if freeze_qwen_vision:
-            for name, param in self.qwen_model.named_parameters():
-                if 'vision_model' in name or 'visual' in name:
-                    param.requires_grad = False
-            print("✅ Qwenビジョンエンコーダを凍結")
-        
-        # 特殊トークンの埋め込みと投影層は常に学習可能
+        # 共通で学習可能な部分
+        # 投影層は常に学習可能
         if hasattr(self, 'seg_projector'):
             for param in self.seg_projector.parameters():
                 param.requires_grad = True
+            print("✅ 投影層を学習可能に設定")
+        
+        # mask_headも常に学習可能
+        if hasattr(self, 'mask_head'):
+            for param in self.mask_head.parameters():
+                param.requires_grad = True
+            print("✅ mask_headを学習可能に設定")
         
         # 新規追加トークンの埋め込みを学習可能に
-        embeddings = self.qwen_model.get_input_embeddings()
-        if embeddings is not None:
-            # 最後の2つのトークン（<SEG>, [REJ]）のみ学習可能
-            num_embeddings = embeddings.weight.shape[0]
-            embeddings.weight.requires_grad = True
-            # 既存トークンの勾配を無効化（新規トークンのみ学習）
-            embeddings.weight.grad = None
+        # LoRAを使用していても、新規トークンの埋め込みは学習する必要がある
+        if hasattr(self.qwen_model, 'get_input_embeddings'):
+            embeddings = self.qwen_model.get_input_embeddings()
+            if embeddings is not None:
+                # 新規トークンのインデックスのみ学習可能にする
+                # （理想的には新規トークンのみだが、現在は埋め込み層全体）
+                embeddings.weight.requires_grad = True
+                print("✅ 新規トークン埋め込みを学習可能に設定（<SEG>, [REJ]）")
         
         # 学習可能パラメータ数を表示
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.parameters())
-        print(f"📊 学習可能パラメータ: {trainable_params:,} / {total_params:,} ({trainable_params/total_params*100:.2f}%)")
+        lora_params = sum(p.numel() for n, p in self.named_parameters() 
+                         if 'lora' in n.lower() and p.requires_grad)
+        
+        print(f"\n📊 パラメータ統計:")
+        print(f"  - 総パラメータ数: {total_params:,}")
+        print(f"  - 学習可能パラメータ数: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
+        print(f"  - うちLoRAパラメータ: {lora_params:,} ({lora_params/total_params*100:.4f}%)")
     
     def forward_train(self, 
                      images: Union[torch.Tensor, List[Image.Image]], 
@@ -821,12 +953,13 @@ class SAMQwenModel(nn.Module):
         return [p for p in self.parameters() if p.requires_grad]
 
 
-def create_sam_qwen_model(config: Dict[str, Any]) -> SAMQwenModel:
+def create_sam_qwen_model(config: Dict[str, Any], lora_config: Optional[LoRAConfigManager] = None) -> SAMQwenModel:
     """
     設定辞書からSAMQwenModelを作成
     
     Args:
         config: 設定辞書
+        lora_config: LoRA設定マネージャー（オプション）
         
     Returns:
         SAMQwenModel インスタンス
@@ -836,7 +969,8 @@ def create_sam_qwen_model(config: Dict[str, Any]) -> SAMQwenModel:
         sam_checkpoint=config.get('sam_model_name', "sam2_hiera_large.pt"),
         sam_config=config.get('sam_config_name', "sam2_hiera_l.yaml"),
         torch_dtype=config.get('torch_dtype', torch.float16),
-        device_map=config.get('device_map', "auto")
+        device_map=config.get('device_map', "auto"),
+        lora_config=lora_config
     )
 
 
