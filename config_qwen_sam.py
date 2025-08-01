@@ -12,8 +12,8 @@ class SAMQwenConfig:
     def __init__(self):
         # Model identifiers
         self.QWEN_MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
-        self.SAM_MODEL_ID = "sam2.1_hiera_large.pt"  # チェックポイントファイル名
-        self.SAM_CONFIG_ID = "sam2.1_hiera_l.yaml"   # 設定ファイル名
+        self.SAM_MODEL_ID = "sam2_hiera_large.pt"  # チェックポイントファイル名
+        self.SAM_CONFIG_ID = "sam2_hiera_l.yaml"   # 設定ファイル名
         
         # Model settings
         self.TORCH_DTYPE = torch.float16
