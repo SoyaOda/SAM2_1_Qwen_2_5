@@ -4,11 +4,13 @@ SAM2.1 + Qwen2.5-VL統合モデル - 最新正式API実装
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Union, Optional, Dict, Any, List, Tuple
 from PIL import Image
 import warnings
 import os
+import math
 
 # Transformers imports for Qwen2.5-VL
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
@@ -179,57 +181,96 @@ class SAMQwenModel(nn.Module):
         self.lora_config.print_lora_summary()
     
     def _apply_lora_to_sam_decoder(self):
-        """SAMのmask_decoderに手動でLoRA層を追加"""
+        """SAMのmask_decoderに手動でLoRA層を追加（正しい実装）"""
         import torch.nn as nn
         
-        # LoRAレイヤーのヘルパークラス
-        class LoRALayer(nn.Module):
-            def __init__(self, in_features, out_features, rank=16, alpha=32):
+        # LoRAを適用するためのカスタムLinear層
+        class LoRALinear(nn.Module):
+            def __init__(self, original_linear, rank=16, alpha=32, dropout=0.1):
                 super().__init__()
+                self.original_linear = original_linear
                 self.rank = rank
                 self.alpha = alpha
                 self.scaling = alpha / rank
+                self.dropout = nn.Dropout(dropout)
                 
-                # LoRA分解: W = W_0 + BA
-                self.lora_A = nn.Parameter(torch.randn(rank, in_features) * 0.01)
-                self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+                # LoRAパラメータ（A: down projection, B: up projection）
+                self.lora_A = nn.Parameter(torch.zeros((rank, original_linear.in_features)))
+                self.lora_B = nn.Parameter(torch.zeros((original_linear.out_features, rank)))
                 
+                # 初期化（Aは正規分布、Bはゼロ）
+                nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+                nn.init.zeros_(self.lora_B)
+                
+                # 元の層のパラメータを凍結
+                for param in self.original_linear.parameters():
+                    param.requires_grad = False
+                
+                # 元の層の重みとバイアスをコピー（参照ではなくコピー）
+                self.register_buffer('weight', original_linear.weight.data.clone())
+                if original_linear.bias is not None:
+                    self.register_buffer('bias', original_linear.bias.data.clone())
+                else:
+                    self.register_buffer('bias', None)
+            
             def forward(self, x):
-                # x @ A^T @ B^T * scaling
-                return x @ self.lora_A.T @ self.lora_B.T * self.scaling
+                # 元の線形変換
+                base_output = F.linear(x, self.weight, self.bias)
+                
+                # LoRAの追加分
+                if self.training:
+                    # x @ A^T -> [batch, rank]
+                    lora_output = x @ self.lora_A.T
+                    lora_output = self.dropout(lora_output)
+                    # @ B^T -> [batch, out_features]
+                    lora_output = lora_output @ self.lora_B.T
+                    return base_output + lora_output * self.scaling
+                
+                return base_output
         
-        # mask_decoder内のq_proj, v_projを探してLoRA層を追加
-        if hasattr(self.sam_model, 'mask_decoder'):
-            for name, module in self.sam_model.mask_decoder.named_modules():
-                if isinstance(module, nn.Linear) and any(target in name for target in ['q_proj', 'v_proj']):
-                    # 元の重みを凍結
-                    module.weight.requires_grad = False
-                    if module.bias is not None:
-                        module.bias.requires_grad = False
+        # SAM2.1では sam_mask_decoder を使用
+        if hasattr(self.sam_model, 'sam_mask_decoder'):
+            mask_decoder = self.sam_model.sam_mask_decoder
+        elif hasattr(self.sam_model, 'mask_decoder'):
+            mask_decoder = self.sam_model.mask_decoder
+        else:
+            print("⚠️ SAM mask_decoderが見つかりません")
+            return
+        
+        if mask_decoder is not None:
+            replaced_count = 0
+            
+            # 再帰的に全モジュールを処理する関数
+            def replace_linear_with_lora(parent_module, parent_name=""):
+                nonlocal replaced_count
+                
+                for name, child in list(parent_module.named_children()):
+                    full_name = f"{parent_name}.{name}" if parent_name else name
                     
-                    # LoRA層を追加
-                    lora_layer = LoRALayer(
-                        module.in_features,
-                        module.out_features,
-                        rank=self.lora_config.sam_lora_r,
-                        alpha=self.lora_config.sam_lora_alpha
-                    ).to(self.device)
-                    
-                    # LoRA層を登録（後でアクセスできるように）
-                    setattr(module, 'lora_layer', lora_layer)
-                    
-                    # forwardメソッドをオーバーライド
-                    original_forward = module.forward
-                    def new_forward(self, x):
-                        base_output = original_forward(x)
-                        lora_output = self.lora_layer(x)
-                        return base_output + lora_output
-                    
-                    # メソッドをバインド
-                    import types
-                    module.forward = types.MethodType(new_forward, module)
-                    
-            print("✅ SAM mask_decoderにLoRAを適用")
+                    if isinstance(child, nn.Linear):
+                        # LoRAを適用する対象を選択（q_proj, k_proj, v_proj, o_projなど）
+                        if any(target in name for target in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'fc1', 'fc2']):
+                            lora_linear = LoRALinear(
+                                child,
+                                rank=self.lora_config.sam_lora_r,
+                                alpha=self.lora_config.sam_lora_alpha,
+                                dropout=self.lora_config.sam_lora_dropout
+                            ).to(self.device)
+                            
+                            # 親モジュールの属性として設定
+                            setattr(parent_module, name, lora_linear)
+                            replaced_count += 1
+                    else:
+                        # 再帰的に子モジュールも処理
+                        replace_linear_with_lora(child, full_name)
+            
+            # mask_decoderの全層を処理
+            replace_linear_with_lora(mask_decoder)
+            
+            if replaced_count > 0:
+                print(f"✅ SAM mask_decoderに{replaced_count}個のLoRA層を適用")
+            else:
+                print("⚠️ SAM mask_decoderにLoRA適用対象の層が見つかりませんでした")
     
     @property
     def device(self) -> torch.device:
@@ -826,12 +867,7 @@ class SAMQwenModel(nn.Module):
             # LoRAパラメータのみが学習可能
             print("✅ Qwen: LoRAパラメータのみ学習可能（ベースモデルは凍結）")
             
-            # SAMのLoRAパラメータを学習可能にする（手動実装）
-            if hasattr(self.sam_model, 'mask_decoder'):
-                for name, module in self.sam_model.mask_decoder.named_modules():
-                    if hasattr(module, 'lora_layer'):
-                        for param in module.lora_layer.parameters():
-                            param.requires_grad = True
+            # SAMのLoRAパラメータを学習可能にする（既に置換済みのLoRALinear内で処理済み）
             print("✅ SAM: LoRAパラメータのみ学習可能")
         else:
             # LoRAなしの場合（従来の動作）
@@ -857,21 +893,48 @@ class SAMQwenModel(nn.Module):
                 param.requires_grad = True
             print("✅ mask_headを学習可能に設定")
         
-        # 新規追加トークンの埋め込みを学習可能に
-        # LoRAを使用していても、新規トークンの埋め込みは学習する必要がある
+        # 新規追加トークンの埋め込みのみを学習可能に（勾配フックを使用）
         if hasattr(self.qwen_model, 'get_input_embeddings'):
             embeddings = self.qwen_model.get_input_embeddings()
             if embeddings is not None:
-                # 新規トークンのインデックスのみ学習可能にする
-                # （理想的には新規トークンのみだが、現在は埋め込み層全体）
+                # 埋め込み層全体を学習可能にする（フックで制御）
                 embeddings.weight.requires_grad = True
-                print("✅ 新規トークン埋め込みを学習可能に設定（<SEG>, [REJ]）")
+                
+                # 新規トークンのIDを取得
+                seg_token_id = self.seg_token_id
+                rej_token_id = self.rej_token_id
+                
+                # 勾配マスキングフックを登録
+                def mask_embedding_gradients(grad):
+                    # 全体をゼロにしてから新規トークンのみ勾配を通す
+                    mask = torch.zeros_like(grad)
+                    mask[seg_token_id] = 1.0
+                    mask[rej_token_id] = 1.0
+                    return grad * mask
+                
+                # フックを登録
+                embeddings.weight.register_hook(mask_embedding_gradients)
+                
+                print(f"✅ 新規トークンのみ学習可能に設定（<SEG>: {seg_token_id}, [REJ]: {rej_token_id}）")
         
         # 学習可能パラメータ数を表示
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.parameters())
-        lora_params = sum(p.numel() for n, p in self.named_parameters() 
-                         if 'lora' in n.lower() and p.requires_grad)
+        # LoRAパラメータ数を正確に計算
+        lora_params = 0
+        qwen_lora_params = 0
+        sam_lora_params = 0
+        
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                # Qwen LoRA
+                if 'lora' in name.lower() and 'qwen' in name:
+                    qwen_lora_params += param.numel()
+                    lora_params += param.numel()
+                # SAM LoRA（LoRALinear内のlora_A, lora_B）
+                elif any(x in name for x in ['lora_A', 'lora_B']) and 'mask_decoder' in name:
+                    sam_lora_params += param.numel()
+                    lora_params += param.numel()
         
         print(f"\n📊 パラメータ統計:")
         print(f"  - 総パラメータ数: {total_params:,}")
