@@ -220,7 +220,14 @@ def main():
     
     # オプティマイザ設定（LoRA用の学習率）
     trainable_params = model.get_trainable_parameters()
-    optimizer = optim.Adam(trainable_params, lr=2e-4, eps=1e-8, weight_decay=1e-4)  # LoRA推奨学習率
+    # より安定した設定（NaN防止）
+    optimizer = optim.AdamW(
+        trainable_params, 
+        lr=1e-5,  # さらに小さい学習率で勾配爆発防止
+        betas=(0.9, 0.98),  # beta2を下げて安定性向上
+        eps=1e-6,
+        weight_decay=0.1  # weight decayを強化
+    )
     
     # 学習設定（段階的拡張テスト）
     num_epochs = 5  # LoRAでは高速に収束するため少なめ
@@ -291,8 +298,9 @@ def main():
             # Backward pass
             loss.backward()
             
-            # 勾配クリッピング（LoRAでは小さめの値）
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=0.5)
+            # 勾配クリッピング（より保守的な値でNaN防止）
+            # 参考: LISA実装では1.0を使用
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             
             optimizer.step()
             
